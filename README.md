@@ -72,8 +72,8 @@ Requires Python â‰¥ 3.10 and a C compiler. No GPU. **No Arm hardware needed** â€
 CI provides it.
 
 ```bash
-git clone https://github.com/<user>/pymvn-arm.git
-cd pymvn-arm
+git clone https://github.com/OmarDez/MVN_Optimization.git
+cd MVN_Optimization
 
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
