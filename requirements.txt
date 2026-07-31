@@ -1,0 +1,5 @@
+numpy>=1.24
+onnx>=1.15
+onnxruntime>=1.17
+pytest>=7
+matplotlib>=3.7
