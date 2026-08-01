@@ -124,6 +124,36 @@ class AngularHead:
         ones = np.ones((X.shape[0], 1), dtype=X.dtype)
         return np.concatenate([ones, X], axis=1)
 
+    def _idx_with_bias(self, kX: np.ndarray) -> np.ndarray:
+        """
+        Same for index inputs. The bias input is the constant 1 = e^{i*0}, whose
+        phase index is 0 -- so the padding column is zeros, not ones.
+        """
+        kX = np.ascontiguousarray(np.asarray(kX, dtype=np.uint8))
+        if kX.shape[1] == self.d1:
+            return kX
+        if kX.shape[1] != self.d1 - 1:
+            raise ValueError(
+                f"expected indices of shape (n, {self.d1}) or (n, {self.d1 - 1}), "
+                f"got {kX.shape}"
+            )
+        zeros = np.zeros((kX.shape[0], 1), dtype=np.uint8)
+        return np.ascontiguousarray(np.concatenate([zeros, kX], axis=1))
+
+    def to_indices(self, X: np.ndarray) -> np.ndarray:
+        """
+        Complex activations on S^1 -> uint8 phase indices, shape (n, d1),
+        bias column included.
+
+        A genuinely phase-native pipeline never calls this: activations would
+        already BE indices, arriving from the previous angular layer or straight
+        from the FFT. It is public so the benchmark can time the conversion
+        separately instead of burying it inside the kernel measurement -- see
+        `logits(..., indices=True)`.
+        """
+        Xb = self._with_bias(np.asarray(X, dtype=np.complex128))
+        return np.ascontiguousarray(alg.phase_to_index(np.angle(Xb), self.b))
+
     # -- backends -----------------------------------------------------------
 
     def _z_complex(self, X, dtype) -> np.ndarray:
@@ -189,21 +219,20 @@ class AngularHead:
         return ort.InferenceSession(model.SerializeToString(), so,
                                     providers=["CPUExecutionProvider"])
 
-    def _z_angular_naive(self, X) -> np.ndarray:
+    def _z_angular_naive(self, kX: np.ndarray) -> np.ndarray:
         """
         Direct transcription of the isomorphism. Materializes the full
         (n, k, d1) index tensor, which is why it is slow and memory-hungry --
         it exists to prove correctness, not speed.
         """
-        Xb = self._with_bias(np.asarray(X, dtype=np.complex128))
-        kX = alg.phase_to_index(np.angle(Xb), self.b).astype(np.int32)
+        kX = kX.astype(np.int32)
         kW = self.kW.astype(np.int32)
 
         kSum = (kX[:, None, :] + kW[None, :, :]) & (self.L - 1)
         c, s = alg.cos_lut(self.b), alg.sin_lut(self.b)
         return c[kSum].sum(axis=2) + 1j * s[kSum].sum(axis=2)
 
-    def _z_angular_tiled(self, X) -> np.ndarray:
+    def _z_angular_tiled(self, kX: np.ndarray) -> np.ndarray:
         """
         Cache-blocked integer datapath.
 
@@ -216,8 +245,6 @@ class AngularHead:
         |acc| <= 127 * d1. For d1 = 4097 that is ~520k, comfortably inside
         int32 and far outside int16 -- hence int32.
         """
-        Xb = self._with_bias(np.asarray(X, dtype=np.complex128))
-        kX = np.ascontiguousarray(alg.phase_to_index(np.angle(Xb), self.b))
         kW = self.kW
         n, d1 = kX.shape
         k = self.n_classes
@@ -242,7 +269,7 @@ class AngularHead:
         scale = 1.0 / alg.LUT_SCALE_I8
         return acc_re * scale + 1j * (acc_im * scale)
 
-    def _z_neon(self, X) -> np.ndarray:
+    def _z_neon(self, kX: np.ndarray) -> np.ndarray:
         """Hand-written C kernel using the AArch64 TBL instruction."""
         lib = _load_lib()
         if lib is None:
@@ -250,8 +277,6 @@ class AngularHead:
                 "kernels/libangular.so not found. Run: bash kernels/build.sh"
             )
 
-        Xb = self._with_bias(np.asarray(X, dtype=np.complex128))
-        kX = np.ascontiguousarray(alg.phase_to_index(np.angle(Xb), self.b))
         n, d1 = kX.shape
         k = self.n_classes
 
@@ -273,28 +298,52 @@ class AngularHead:
 
     # -- public API ---------------------------------------------------------
 
-    def logits(self, X: np.ndarray) -> np.ndarray:
-        """Return the complex pre-activation z, shape (n, n_classes)."""
+    def logits(self, X: np.ndarray, indices: bool = False) -> np.ndarray:
+        """
+        Return the complex pre-activation z, shape (n, n_classes).
+
+        Args:
+            X: (n, d) or (n, d+1) complex activations on S^1. With
+                `indices=True`, uint8 phase indices of the same shape instead --
+                already on Z_L, so the angular backends skip the np.angle
+                conversion entirely. That is the phase-native case: indices
+                arrive from the previous angular layer or from the FFT and never
+                leave the integer domain.
+
+        The complex backends cannot consume indices natively -- they need
+        Cartesian values -- so with `indices=True` they reconstruct via the
+        lookup. That reconstruction feeds them b-bit activations, so they return
+        a DIFFERENT (quantized) quantity than in complex mode, not merely a
+        differently-timed one. The angular backends return bit-identical results
+        in both modes, which is what makes the flag a clean measurement of the
+        conversion cost.
+        """
+        angular = self.backend in ("angular_naive", "angular_tiled", "neon")
+
+        if angular:
+            kX = self._idx_with_bias(X) if indices else self.to_indices(X)
+            if self.backend == "angular_naive":
+                return self._z_angular_naive(kX)
+            if self.backend == "angular_tiled":
+                return self._z_angular_tiled(kX)
+            return self._z_neon(kX)
+
+        if indices:
+            X = alg.index_to_unit(self._idx_with_bias(X), self.b)
         if self.backend == "complex128":
             return self._z_complex(X, np.complex128)
         if self.backend == "complex64":
             return self._z_complex(X, np.complex64).astype(np.complex128)
         if self.backend == "onnx":
             return self._z_onnx(X)
-        if self.backend == "angular_naive":
-            return self._z_angular_naive(X)
-        if self.backend == "angular_tiled":
-            return self._z_angular_tiled(X)
-        if self.backend == "neon":
-            return self._z_neon(X)
         raise AssertionError("unreachable")
 
-    def predict(self, X: np.ndarray) -> np.ndarray:
+    def predict(self, X: np.ndarray, indices: bool = False) -> np.ndarray:
         """Class prediction: argmax over Re(z), the one-vs-all MVN rule."""
-        return np.real(self.logits(X)).argmax(axis=1)
+        return np.real(self.logits(X, indices=indices)).argmax(axis=1)
 
-    def accuracy(self, X: np.ndarray, y: np.ndarray) -> float:
-        return float((self.predict(X) == np.asarray(y)).mean())
+    def accuracy(self, X: np.ndarray, y: np.ndarray, indices: bool = False) -> float:
+        return float((self.predict(X, indices=indices) == np.asarray(y)).mean())
 
     def mac_report(self) -> dict:
         """

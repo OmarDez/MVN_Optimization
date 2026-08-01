@@ -20,13 +20,16 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"          # add ".[train]" for torch/torchvision
 
 bash kernels/build.sh            # -> kernels/libangular.so (NEON on aarch64, scalar elsewhere)
-pytest tests/ -v                 # expect 81 passed, +5 skipped off-Arm
+pytest tests/ -v                 # 101 passed on Arm; 92 passed +9 skipped elsewhere
 
 pytest tests/test_algebra.py::test_group_isomorphism -v          # one test
 pytest tests/test_parity.py -k "neon" -v                         # by pattern
 
 python bench/run_bench.py --synthetic --repeat 3 --batches 64 --bits 4 --out results/smoke.json
-python bench/run_bench.py --synthetic --repeat 30 --out results/local.json
+python bench/run_bench.py --synthetic --cases head_512x10 layer_2048x64 layer_4096x256 \
+  --repeat 30 --out results/local.json
+python bench/run_bench.py --synthetic --backends onnx neon --bits 4 --batches 2048 \
+  --pre-indexed --out results/preindexed.json
 python bench/report.py results/*.json --out docs/                # -> docs/RESULTS.md
 
 python scripts/train_zoo.py --model mlmvn_fft --dataset mnist    # -> models/*.npz
@@ -86,6 +89,16 @@ is ≤ 16 bytes = one NEON register = one `vqtbl1q_u8`.
   it essentially exactly. Drift there is a kernel bug, not quantization.
 - **Tile size is a performance knob only** — `test_tiling_is_schedule_invariant`
   enforces that it never changes results.
+- **`logits(X, indices=True)` must stay bit-identical** to `logits(X)` on the
+  angular backends. The conversion is overhead, never arithmetic; divergence
+  means the fast path computes something else. The complex backends are the
+  exception — fed indices they see b-bit activations and return a genuinely
+  quantized quantity.
+- **Never rank a backend against `complex128`/`complex64` in reports.** They are
+  reference implementations, not deployment targets; `bench/report.py` ranks
+  only the angular backends against `onnx` for this reason.
+- **`--cases` exists to keep CI finite.** Without it every synthetic shape runs,
+  and `angular_tiled` at `layer_8192x512` needs roughly 21 minutes per cell.
 - Checkpoints must load with `allow_pickle=False`; no Python objects in `.npz`.
 - Lifts are fitted on training features only.
 

@@ -162,7 +162,57 @@ def test_agreement_improves_with_bits(fixture):
 
 
 # ---------------------------------------------------------------------------
-# Group 4: the contract the MAC claim rests on
+# Group 4: the pre-indexed (phase-native) input path
+# ---------------------------------------------------------------------------
+
+ANGULAR_BACKENDS = ["angular_naive", "angular_tiled", "neon"]
+
+
+@pytest.mark.parametrize("backend", ANGULAR_BACKENDS)
+@pytest.mark.parametrize("b", BITS)
+def test_pre_indexed_matches_complex_input(fixture, backend, b):
+    """
+    Feeding indices directly must be BIT-IDENTICAL to letting the head convert
+    them itself. The conversion is pure overhead, not part of the arithmetic --
+    if these ever diverge, the fast path is computing something else.
+    """
+    if backend == "neon" and not neon_available():
+        pytest.skip("kernel not built for this host")
+    W, X = fixture
+    h = _head(W, b, backend)
+    kX = h.to_indices(X)
+    np.testing.assert_array_equal(h.logits(kX, indices=True), h.logits(X))
+
+
+def test_to_indices_shape_and_dtype(fixture):
+    """Indices are uint8 (the kernel's operand type) and carry the bias column."""
+    W, X = fixture
+    h = _head(W, 4, "angular_tiled")
+    kX = h.to_indices(X)
+    assert kX.dtype == np.uint8
+    assert kX.shape == (X.shape[0], D + 1)
+    assert kX.max() < h.L
+    assert np.array_equal(kX[:, 0], np.zeros(X.shape[0]))  # bias index is 0
+
+
+def test_pre_indexed_accepts_missing_bias_column(fixture):
+    """(n, d) indices are padded with the bias index exactly like (n, d) complex."""
+    W, X = fixture
+    h = _head(W, 4, "angular_tiled")
+    kX = h.to_indices(X)
+    np.testing.assert_array_equal(h.logits(kX[:, 1:], indices=True),
+                                  h.logits(kX, indices=True))
+
+
+def test_pre_indexed_rejects_wrong_width(fixture):
+    W, X = fixture
+    h = _head(W, 4, "angular_tiled")
+    with pytest.raises(ValueError):
+        h.logits(h.to_indices(X)[:, :5], indices=True)
+
+
+# ---------------------------------------------------------------------------
+# Group 5: the contract the MAC claim rests on
 # ---------------------------------------------------------------------------
 
 def test_mac_report_requires_phase_only(fixture):

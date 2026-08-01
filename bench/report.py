@@ -17,24 +17,63 @@ def load(paths):
     return recs
 
 
+#: Backends that are candidate deployment targets. complex128/complex64 are
+#: reference implementations, not things anyone ships -- ranking against them
+#: would manufacture a speedup out of NumPy's convenience, which is exactly the
+#: self-deception PLAN.md section 6 warns about.
+ANGULAR = ("angular_naive", "angular_tiled", "neon")
+
+
 def table_speedup(recs) -> str:
-    """Median latency per backend, with speedup relative to the ONNX baseline."""
+    """Median latency per backend, with the angular path ranked against ONNX."""
     rows = defaultdict(dict)
     for r in recs:
         key = (r["arch"], r["model"], r["b"], r["batch"])
         rows[key][r["backend"]] = r["median_ms"]
 
     backends = sorted({r["backend"] for r in recs})
-    out = ["| arch | model | b | batch | " + " | ".join(backends) + " | best vs onnx |",
+    out = ["| arch | model | b | batch | " + " | ".join(backends)
+           + " | best angular vs onnx |",
            "|---|---|---|---|" + "---|" * (len(backends) + 1)]
     for key in sorted(rows):
         row = rows[key]
         base = row.get("onnx")
         cells = [f"{row[b]:.2f}" if b in row else "-" for b in backends]
-        best = min((v for k, v in row.items() if k != "onnx"), default=None)
-        sp = f"{base / best:.2f}x" if base and best else "-"
+        best = min((v for k, v in row.items() if k in ANGULAR), default=None)
+        sp = f"{base / best:.3f}x" if base and best else "-"
         out.append("| " + " | ".join(str(k) for k in key) + " | " +
                    " | ".join(cells) + f" | {sp} |")
+    return "\n".join(out)
+
+
+def table_crossover(recs) -> str:
+    """
+    The neon/onnx ratio against layer size. This is the curve that decides
+    whether multiplier-free inference ever overtakes a tuned BLAS GEMM, so it
+    gets its own table rather than being buried in the latency dump.
+    """
+    rows = defaultdict(dict)
+    for r in recs:
+        key = (r["arch"], r["model"], r["b"], r["batch"], r.get("input_mode", "complex"))
+        rows[key][r["backend"]] = r
+    def layer_macs(row):
+        """Per-sample MACs. This -- not the batch -- is what moves the ratio."""
+        r = row.get("neon") or row.get("onnx")
+        return r["n_classes"] * (r["d"] + 1)
+
+    out = ["| arch | model | layer MACs | total MACs | b | batch | input "
+           "| onnx ms | neon ms | neon/onnx |",
+           "|---|---|---|---|---|---|---|---|---|---|"]
+    for key in sorted(rows, key=lambda k: (k[0], layer_macs(rows[k]), k[3])):
+        row = rows[key]
+        if "onnx" not in row or "neon" not in row:
+            continue
+        ratio = row["onnx"]["median_ms"] / row["neon"]["median_ms"]
+        arch, model, b, batch, mode = key
+        out.append(f"| {arch} | {model} | {layer_macs(row) / 1e6:.3f}M "
+                   f"| {row['neon']['macs'] / 1e9:.3f}G | {b} | {batch} | {mode} | "
+                   f"{row['onnx']['median_ms']:.2f} | {row['neon']['median_ms']:.2f} | "
+                   f"**{ratio:.3f}** |")
     return "\n".join(out)
 
 
@@ -78,6 +117,7 @@ def main() -> int:
     md = ["# Benchmark results\n",
           f"_{len(recs)} records; hosts: "
           + ", ".join(sorted({r.get('cpu', r['arch']) for r in recs})) + "_\n",
+          "## Crossover: neon vs ONNX against layer size\n", table_crossover(recs), "",
           "## Latency\n", table_speedup(recs), "",
           "## Weight memory\n", table_memory(recs), "",
           "## Accuracy\n", table_accuracy(recs), ""]

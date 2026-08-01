@@ -79,14 +79,26 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 bash kernels/build.sh      # NEON path on aarch64; portable scalar C elsewhere
-pytest tests/ -v           # expect 81 passed (+5 skipped off-Arm)
+pytest tests/ -v           # 101 passed on Arm; 92 passed +9 skipped elsewhere
 ```
 
 ## Run
 
 ```bash
-# Benchmark all backends, no checkpoint required
-python bench/run_bench.py --synthetic --repeat 30 --out results/local.json
+# Benchmark, no checkpoint required. --cases matters: the two largest shapes
+# are ruinously slow under angular_tiled, so pair them with --backends.
+python bench/run_bench.py --synthetic \
+  --cases head_512x10 layer_2048x64 layer_4096x256 \
+  --repeat 30 --out results/local.json
+
+# The crossover sweep: does the multiplier-free path ever overtake BLAS?
+python bench/run_bench.py --synthetic --backends onnx neon \
+  --bits 4 --batches 2048 --repeat 30 --out results/crossover.json
+
+# Phase-native regime: activations arrive as indices, so the np.angle
+# conversion never happens. Its cost is reported as a separate column.
+python bench/run_bench.py --synthetic --backends onnx neon \
+  --bits 4 --batches 2048 --pre-indexed --out results/preindexed.json
 
 # Train and freeze a model, then benchmark it
 python scripts/train_zoo.py --model mlmvn_fft --dataset mnist
@@ -95,6 +107,8 @@ python bench/run_bench.py --models models/*.npz --out results/zoo.json
 # Generate result tables
 python bench/report.py results/*.json --out docs/
 ```
+
+Measured numbers, regenerated from CI artifacts: **[docs/RESULTS.md](docs/RESULTS.md)**.
 
 ## Verify the central claim yourself
 

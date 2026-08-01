@@ -459,7 +459,8 @@ bash kernels/build.sh
 pytest tests/ -v
 ```
 
-Expected: **81 passed**, plus 5 skipped on non-Arm hosts (the NEON tests).
+Expected: **101 passed** on Arm; **92 passed plus 9 skipped** elsewhere (the
+NEON tests and the pre-indexed NEON parity tests).
 
 ```bash
 # Benchmark, no checkpoint required

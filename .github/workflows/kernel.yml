@@ -1,0 +1,45 @@
+name: kernel
+
+# Fast feedback loop for the NEON intrinsics. The full bench workflow takes
+# ~25 minutes because it measures; this one only builds the kernel and checks
+# that it still computes the right thing, which is the question you actually
+# have while editing vqtbl1q_u8 code with no local Arm hardware.
+#
+# Runs on every push that touches the kernel or the code paths that feed it.
+
+on:
+  push:
+    paths:
+      - 'kernels/**'
+      - 'pymvn/angular.py'
+      - 'pymvn/algebra.py'
+      - '.github/workflows/kernel.yml'
+  pull_request:
+    paths:
+      - 'kernels/**'
+      - 'pymvn/angular.py'
+      - 'pymvn/algebra.py'
+  workflow_dispatch:
+
+jobs:
+  parity:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install -e ".[dev]"
+      - name: Build angular kernel
+        run: bash kernels/build.sh
+
+      - name: NEON path must be active on this runner
+        run: |
+          python -c "
+          from pymvn import neon_available
+          assert neon_available(), 'kernel built without the NEON path on aarch64'
+          print('NEON path active')
+          "
+
+      # The kernel is only worth anything if it agrees with the reference.
+      - name: Kernel parity
+        run: pytest tests/test_parity.py -k "neon or pre_indexed" -v

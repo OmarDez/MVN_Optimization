@@ -87,17 +87,7 @@ def host_info() -> dict:
 # Timing
 # ---------------------------------------------------------------------------
 
-def time_backend(head: AngularHead, X: np.ndarray, repeat: int, warmup: int) -> dict:
-    """Return latency statistics in milliseconds for one full forward pass."""
-    for _ in range(warmup):
-        head.logits(X)
-
-    samples = []
-    for _ in range(repeat):
-        t0 = time.perf_counter()
-        head.logits(X)
-        samples.append((time.perf_counter() - t0) * 1e3)
-
+def _stats(samples: list[float]) -> dict:
     s = np.asarray(samples)
     return {
         "median_ms": float(np.median(s)),
@@ -105,8 +95,38 @@ def time_backend(head: AngularHead, X: np.ndarray, repeat: int, warmup: int) -> 
         "p95_ms": float(np.percentile(s, 95)),
         "min_ms": float(s.min()),
         "std_ms": float(s.std()),
-        "repeats": repeat,
+        "repeats": len(s),
     }
+
+
+def _time(fn, repeat: int, warmup: int) -> dict:
+    for _ in range(warmup):
+        fn()
+    samples = []
+    for _ in range(repeat):
+        t0 = time.perf_counter()
+        fn()
+        samples.append((time.perf_counter() - t0) * 1e3)
+    return _stats(samples)
+
+
+def time_backend(head: AngularHead, X: np.ndarray, repeat: int, warmup: int,
+                 indices: bool = False) -> dict:
+    """Return latency statistics in milliseconds for one full forward pass."""
+    return _time(lambda: head.logits(X, indices=indices), repeat, warmup)
+
+
+def time_conversion(head: AngularHead, X: np.ndarray, repeat: int,
+                    warmup: int) -> dict:
+    """
+    Cost of complex activations -> phase indices (np.angle plus rounding).
+
+    This is float work that a genuinely phase-native pipeline never performs:
+    activations would already be indices, arriving from the previous angular
+    layer or straight from the FFT. Measuring it separately keeps it out of the
+    kernel number instead of silently inflating it.
+    """
+    return _time(lambda: head.to_indices(X), repeat, warmup)
 
 
 # ---------------------------------------------------------------------------
@@ -115,18 +135,34 @@ def time_backend(head: AngularHead, X: np.ndarray, repeat: int, warmup: int) -> 
 
 def synthetic_cases(seed: int = 0):
     """
-    Three shapes spanning the interesting regime.
+    Five shapes spanning the interesting regime.
 
-    The real hybrid head (512 features x 10 classes, ~5k MACs) is far too small
-    to measure anything -- Python and allocation overhead dominate completely.
-    The larger synthetic layers exist to expose the crossover point where the
-    angular datapath starts to win, which is itself a result worth reporting.
+    The real hybrid head (512 features x 10 classes) is far too small to measure
+    anything -- Python and allocation overhead dominate completely. The larger
+    layers exist to expose the crossover point where the angular datapath
+    overtakes BLAS, which is itself the result worth reporting.
+
+    The measured neon/onnx ratio grows monotonically with layer size and a
+    log-log fit over the first three points gives ratio ~ MACs^0.277, which
+    projects parity at ~7.3G MACs. The last two shapes bracket that prediction:
+
+        shape             MACs @ batch 2048   neon/onnx
+        head_512x10                 10.5M     0.163   measured
+        layer_2048x64                269M     0.397   measured
+        layer_4096x256              2.15G     0.712   measured
+        layer_6144x384              4.83G     ~0.90   projected
+        layer_8192x512              8.59G     ~1.05   projected
+
+    If the ratio flattens below 1.0 instead, the kernel went memory-bound before
+    catching BLAS -- an equally reportable result, since it bounds the ceiling.
     """
     rng = np.random.default_rng(seed)
     for name, d, k in [
         ("head_512x10", 512, 10),        # the real hybrid head
         ("layer_2048x64", 2048, 64),     # mid-size
         ("layer_4096x256", 4096, 256),   # large; where tiling should pay off
+        ("layer_6144x384", 6144, 384),   # brackets the projected crossover
+        ("layer_8192x512", 8192, 512),   # expected to cross 1.0
     ]:
         W = np.exp(1j * rng.uniform(0, 2 * np.pi, (k, d + 1))) / np.sqrt(d + 1)
         yield name, W, d
@@ -147,12 +183,20 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--models", nargs="*", default=[], help="checkpoint .npz files")
     ap.add_argument("--synthetic", action="store_true", help="use synthetic layers")
+    ap.add_argument("--cases", nargs="*", default=None,
+                    help="restrict --synthetic to these case names. Without it "
+                         "every shape runs, and the largest are ruinously slow "
+                         "under angular_tiled -- pair them with --backends.")
     ap.add_argument("--backends", nargs="*", default=None)
     ap.add_argument("--bits", nargs="*", type=int, default=[3, 4])
     ap.add_argument("--batches", nargs="*", type=int, default=[64, 512, 2048])
     ap.add_argument("--repeat", type=int, default=30)
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--tile", nargs=2, type=int, default=[64, 256])
+    ap.add_argument("--pre-indexed", action="store_true",
+                    help="feed the angular backends uint8 phase indices instead "
+                         "of complex activations, and time the conversion "
+                         "separately. This is the phase-native regime.")
     ap.add_argument("--out", default="results/bench.json")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -167,6 +211,12 @@ def main() -> int:
     print(f"backends: {', '.join(backends)}\n", flush=True)
 
     cases = list(synthetic_cases(args.seed)) if args.synthetic else []
+    if args.cases is not None:
+        known = {name for name, _, _ in cases}
+        unknown = set(args.cases) - known
+        if unknown:
+            ap.error(f"unknown case(s) {sorted(unknown)}; known: {sorted(known)}")
+        cases = [c for c in cases if c[0] in set(args.cases)]
     cases += list(checkpoint_cases(args.models))
     if not cases:
         ap.error("nothing to benchmark: pass --synthetic and/or --models")
@@ -181,22 +231,40 @@ def main() -> int:
 
             for b in args.bits:
                 row = {}
+                convert_ms = None
                 for backend in backends:
                     head = AngularHead(W, b=b, backend=backend,
                                        tile=tuple(args.tile))
+
+                    # Only the angular backends can consume indices natively.
+                    # The complex baselines keep their full-precision input --
+                    # feeding them b-bit activations would change what the
+                    # baseline IS, not merely how fast it runs.
+                    angular = backend in ("angular_naive", "angular_tiled", "neon")
+                    use_idx = args.pre_indexed and angular
                     try:
-                        stats = time_backend(head, X, args.repeat, args.warmup)
+                        if use_idx:
+                            if convert_ms is None:
+                                convert_ms = time_conversion(
+                                    head, X, args.repeat, args.warmup)["median_ms"]
+                            Xin = head.to_indices(X)
+                        else:
+                            Xin = X
+                        stats = time_backend(head, Xin, args.repeat, args.warmup,
+                                             indices=use_idx)
                     except Exception as exc:
                         print(f"  [skip] {backend}: {exc}", flush=True)
                         continue
 
-                    pred = head.predict(X)
+                    pred = head.predict(Xin, indices=use_idx)
                     rec = {
                         "model": model_name, "backend": backend, "b": b,
                         "batch": int(batch), "d": int(d),
                         "n_classes": int(W.shape[0]),
                         "macs": int(W.shape[0] * (d + 1) * batch),
                         "agreement_vs_fp": float((pred == ref_pred).mean()),
+                        "input_mode": "indices" if use_idx else "complex",
+                        "convert_ms": convert_ms if use_idx else None,
                         **head.mac_report(), **stats, **host,
                     }
                     records.append(rec)
@@ -211,6 +279,8 @@ def main() -> int:
                     ms = row[backend]
                     sp = f" ({base / ms:5.2f}x)" if base and backend != "onnx" else ""
                     parts.append(f"{backend}={ms:8.2f}ms{sp}")
+                if convert_ms is not None:
+                    parts.append(f"[convert={convert_ms:.2f}ms]")
                 print(f"  {head_line}  " + "  ".join(parts), flush=True)
 
                 if base:

@@ -43,21 +43,41 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: bash kernels/build.sh
 
-      # Arm's own system reporting tool: records exactly how this machine is
-      # configured, so the numbers below are attributable to real hardware.
-      - name: Capture host configuration (Arm sysreport)
+      # Records exactly how this machine is configured, so the numbers below are
+      # attributable to real hardware rather than to a claim. uname/lscpu always
+      # land; Arm's own sysreport is layered on top when it can be located,
+      # since its script name and path have moved between revisions.
+      - name: Capture host configuration
         continue-on-error: true
         run: |
-          git clone --depth 1 https://github.com/ArmDeveloperEcosystem/sysreport.git /tmp/sysreport
-          python /tmp/sysreport/sysreport.py 2>&1 | tee results/sysreport-${{ matrix.runner }}.txt || true
+          mkdir -p results
+          { uname -a; echo; lscpu; } > results/hostinfo-${{ matrix.runner }}.txt
+          git clone --depth 1 https://github.com/ArmDeveloperEcosystem/sysreport.git /tmp/sysreport || true
+          SR=$(find /tmp/sysreport -name 'sysreport*.py' | head -1)
+          [ -n "$SR" ] && python "$SR" >> results/hostinfo-${{ matrix.runner }}.txt 2>&1 || true
 
       - name: Benchmark
         env:
           PYMVN_THREADS: '1'
         run: |
           python bench/run_bench.py --synthetic \
+            --cases head_512x10 layer_2048x64 layer_4096x256 \
             --bits 3 4 --batches 64 512 2048 --repeat 30 \
             --out results/bench-${{ matrix.runner }}.json
+
+      # Crossover hunt: the neon/onnx ratio is still climbing at the largest
+      # shape above. These two extra shapes bracket the projected parity point
+      # at ~7.3G MACs. angular_tiled is excluded deliberately -- it needs ~10.7s
+      # per iteration at 4096x256 already, so it would dominate the wall time
+      # while telling us nothing new.
+      - name: Crossover sweep (onnx vs neon)
+        env:
+          PYMVN_THREADS: '1'
+        run: |
+          python bench/run_bench.py --synthetic \
+            --backends onnx neon \
+            --bits 4 --batches 2048 --repeat 30 \
+            --out results/crossover-${{ matrix.runner }}.json
 
       - uses: actions/upload-artifact@v4
         with:
