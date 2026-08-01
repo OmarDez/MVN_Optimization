@@ -70,6 +70,9 @@ def _load_lib():
     lib.angular_gemm.restype = None
     lib.angular_has_neon.argtypes = []
     lib.angular_has_neon.restype = ctypes.c_int
+    if hasattr(lib, "angular_gemm_packed"):
+        lib.angular_gemm_packed.argtypes = lib.angular_gemm.argtypes
+        lib.angular_gemm_packed.restype = None
     _lib = lib
     return _lib
 
@@ -92,10 +95,14 @@ class AngularHead:
             and only the angle is quantized ("full-polar"): more accurate, but
             a real multiply survives per MAC.
         tile: (tile_n, tile_d) for the angular_tiled backend.
+        packed: store weights as two 4-bit indices per byte (b <= 4 only) and
+            unpack them inside the kernel. Halves the weight footprint; the
+            throughput cost is what the benchmark exists to measure. `neon` only.
     """
 
     def __init__(self, W: np.ndarray, b: int = 4, backend: str = "complex128",
-                 phase_only: bool = True, tile: tuple[int, int] = (64, 256)):
+                 phase_only: bool = True, tile: tuple[int, int] = (64, 256),
+                 packed: bool = False):
         if backend not in BACKENDS:
             raise ValueError(f"backend must be one of {BACKENDS}, got {backend!r}")
         self.W_fp = np.asarray(W, dtype=np.complex128)
@@ -111,6 +118,19 @@ class AngularHead:
         self.kW = np.ascontiguousarray(
             alg.phase_to_index(np.angle(self.W_fp), self.b), dtype=np.uint8
         )
+
+        if packed:
+            if backend != "neon":
+                raise ValueError("packed=True is only implemented for backend='neon'")
+            if self.b > 4:
+                raise ValueError(f"packed=True needs b <= 4, got b={self.b}")
+            if self.d1 % 2:
+                raise ValueError(
+                    f"packed=True needs an even feature count; this head has "
+                    f"d1={self.d1}. Pad W with a zero column."
+                )
+        self.packed = bool(packed)
+        self.kW_packed = alg.pack_indices(self.kW, self.b) if packed else None
 
         self._ort_sess = None  # built lazily
 
@@ -289,9 +309,17 @@ class AngularHead:
         pi8 = lambda a: a.ctypes.data_as(ctypes.POINTER(ctypes.c_int8))
         p32 = lambda a: a.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
 
-        lib.angular_gemm(p8(kX), p8(np.ascontiguousarray(self.kW)),
-                         pi8(c8), pi8(s8), p32(acc_re), p32(acc_im),
-                         n, k, d1, self.L)
+        if self.packed:
+            if not hasattr(lib, "angular_gemm_packed"):
+                raise RuntimeError(
+                    "libangular.so predates packed weights. Run: bash kernels/build.sh"
+                )
+            fn, kw = lib.angular_gemm_packed, self.kW_packed
+        else:
+            fn, kw = lib.angular_gemm, self.kW
+        fn(p8(kX), p8(np.ascontiguousarray(kw)),
+           pi8(c8), pi8(s8), p32(acc_re), p32(acc_im),
+           n, k, d1, self.L)
 
         scale = 1.0 / alg.LUT_SCALE_I8
         return acc_re * scale + 1j * (acc_im * scale)
@@ -354,10 +382,19 @@ class AngularHead:
         multiplier_free = self.backend.startswith("angular") or self.backend == "neon"
         if multiplier_free and not self.phase_only:
             multiplier_free = False  # |w| != 1 reintroduces a real multiply
+        n_w = self.W_fp.size
+        weight_bytes = self.kW_packed.nbytes if self.packed else self.kW.nbytes
         return {
             "head_macs": macs,
             "real_mults_per_mac": 0 if multiplier_free else 4,
             "int_adds_per_mac": 1 if multiplier_free else 0,
             "lut_bytes": self.L,
             "multiplier_free": multiplier_free,
+            "packed": self.packed,
+            # Byte accounting for the compression claim. complex128 is the
+            # unquantized form; fp32 real/imag is what actually ships today.
+            "weight_bytes": int(weight_bytes),
+            "weight_bytes_complex128": int(n_w * 16),
+            "weight_bytes_fp32_reim": int(n_w * 8),
+            "compression_vs_fp32_reim": (n_w * 8) / max(weight_bytes, 1),
         }

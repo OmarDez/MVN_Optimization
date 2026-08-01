@@ -55,19 +55,31 @@ int angular_has_neon(void) { return ANGULAR_NEON; }
 /* ------------------------------------------------------------------------ */
 /* Portable scalar reference. Correct everywhere; used for b > 4 and on x86. */
 /* ------------------------------------------------------------------------ */
+/* Unrolled by two to match angular_gemm_packed's loop structure exactly. That
+ * is not cosmetic: the packed kernel consumes two indices per byte and so
+ * processes two features per iteration by construction. Comparing it against a
+ * non-unrolled baseline would credit packing with a loop-overhead win it did
+ * not earn. Same shape here, so the difference measures packing alone. */
 static void angular_gemm_scalar(const uint8_t *kx, const uint8_t *kw,
                                 const int8_t *lut_cos, const int8_t *lut_sin,
                                 int32_t *acc_re, int32_t *acc_im,
                                 int n, int k, int d, int L)
 {
     const uint8_t mask = (uint8_t)(L - 1);
+    const int d2 = d & ~1;
     for (int i = 0; i < n; ++i) {
         const uint8_t *xrow = kx + (size_t)i * d;
         for (int j = 0; j < k; ++j) {
             const uint8_t *wrow = kw + (size_t)j * d;
             int32_t sre = 0, sim = 0;
-            for (int t = 0; t < d; ++t) {
-                uint8_t idx = (uint8_t)((xrow[t] + wrow[t]) & mask);
+            for (int t = 0; t < d2; t += 2) {
+                uint8_t i0 = (uint8_t)((xrow[t]     + wrow[t])     & mask);
+                uint8_t i1 = (uint8_t)((xrow[t + 1] + wrow[t + 1]) & mask);
+                sre += lut_cos[i0] + lut_cos[i1];
+                sim += lut_sin[i0] + lut_sin[i1];
+            }
+            if (d2 != d) {                              /* odd tail */
+                uint8_t idx = (uint8_t)((xrow[d - 1] + wrow[d - 1]) & mask);
                 sre += lut_cos[idx];
                 sim += lut_sin[idx];
             }
@@ -141,6 +153,47 @@ static void angular_gemm_neon16(const uint8_t *kx, const uint8_t *kw,
     }
 }
 #endif /* ANGULAR_NEON */
+
+/* ------------------------------------------------------------------------ */
+/* Packed weights: two 4-bit indices per byte (b <= 4 only).                 */
+/*                                                                           */
+/* Halves the weight footprint, which is the claim that does NOT depend on   */
+/* beating a tuned GEMM. kw_packed holds d/2 bytes per class row; the low    */
+/* nibble is the even feature, the high nibble the odd one. Unpacking costs  */
+/* one AND and one shift, both cheap next to the table lookup -- but the     */
+/* point is to MEASURE that, not to assume it.                               */
+/*                                                                           */
+/* d must be even; the caller pads. Only the scalar form is provided: the    */
+/* NEON path would need a de-interleave to keep lanes aligned with the       */
+/* unpacked kx, and that is a separate optimization with its own parity risk.*/
+/* ------------------------------------------------------------------------ */
+void angular_gemm_packed(const uint8_t *kx, const uint8_t *kw_packed,
+                         const int8_t *lut_cos, const int8_t *lut_sin,
+                         int32_t *acc_re, int32_t *acc_im,
+                         int n, int k, int d, int L)
+{
+    const uint8_t mask = (uint8_t)(L - 1);
+    const int dp = d / 2;
+    for (int i = 0; i < n; ++i) {
+        const uint8_t *xrow = kx + (size_t)i * d;
+        for (int j = 0; j < k; ++j) {
+            const uint8_t *wrow = kw_packed + (size_t)j * dp;
+            int32_t sre = 0, sim = 0;
+            for (int t = 0; t < dp; ++t) {
+                const uint8_t packed = wrow[t];
+                const uint8_t w_lo = packed & 0x0Fu;
+                const uint8_t w_hi = (uint8_t)(packed >> 4);
+
+                uint8_t i0 = (uint8_t)((xrow[2 * t]     + w_lo) & mask);
+                uint8_t i1 = (uint8_t)((xrow[2 * t + 1] + w_hi) & mask);
+                sre += lut_cos[i0] + lut_cos[i1];
+                sim += lut_sin[i0] + lut_sin[i1];
+            }
+            acc_re[(size_t)i * k + j] = sre;
+            acc_im[(size_t)i * k + j] = sim;
+        }
+    }
+}
 
 /* ------------------------------------------------------------------------ */
 /* Dispatch                                                                  */

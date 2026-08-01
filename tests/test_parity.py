@@ -44,6 +44,16 @@ def _head(W, b, backend, **kw):
     return AngularHead(W, b=b, backend=backend, **kw)
 
 
+def _lib_missing() -> bool:
+    """
+    True when libangular.so was never built. Distinct from `not neon_available()`:
+    the packed path is portable scalar C, so it runs off-Arm too -- only the
+    vqtbl1q_u8 path needs aarch64.
+    """
+    from pymvn.angular import _load_lib
+    return _load_lib() is None
+
+
 # ---------------------------------------------------------------------------
 # Group 1: backends implementing identical arithmetic
 # ---------------------------------------------------------------------------
@@ -212,7 +222,59 @@ def test_pre_indexed_rejects_wrong_width(fixture):
 
 
 # ---------------------------------------------------------------------------
-# Group 5: the contract the MAC claim rests on
+# Group 5: packed weights (two 4-bit indices per byte)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(_lib_missing(), reason="kernel not built")
+@pytest.mark.parametrize("b", [1, 2, 3, 4])
+def test_packed_matches_unpacked(b):
+    """
+    Packing is a storage format, not a different computation. Any divergence is
+    a nibble-order bug, which is the failure mode this scheme invites.
+    """
+    rng = np.random.default_rng(31)
+    W = np.exp(1j * rng.uniform(0, 2 * np.pi, (K, 64)))   # even d1
+    X = np.exp(1j * rng.uniform(0, 2 * np.pi, (32, 63)))
+    ref = _head(W, b, "neon").logits(X)
+    got = _head(W, b, "neon", packed=True).logits(X)
+    np.testing.assert_array_equal(got, ref)
+
+
+@pytest.mark.skipif(_lib_missing(), reason="kernel not built")
+def test_packed_halves_the_weight_bytes():
+    """The compression claim, as a measured property rather than arithmetic."""
+    rng = np.random.default_rng(32)
+    W = np.exp(1j * rng.uniform(0, 2 * np.pi, (K, 64)))
+    plain = _head(W, 4, "neon").mac_report()
+    packed = _head(W, 4, "neon", packed=True).mac_report()
+    assert packed["weight_bytes"] * 2 == plain["weight_bytes"]
+    assert packed["compression_vs_fp32_reim"] == 16.0
+    assert packed["weight_bytes"] * 32 == packed["weight_bytes_complex128"]
+
+
+def test_packing_roundtrip_over_the_whole_group():
+    """Exhaustive: every representable index survives pack -> unpack."""
+    from pymvn import algebra as alg
+    for b in (1, 2, 3, 4):
+        k = np.arange(alg.n_roots(b), dtype=np.uint8)
+        back = alg.unpack_indices(alg.pack_indices(k, b), b, width=len(k))
+        np.testing.assert_array_equal(back, k)
+
+
+def test_packing_rejects_unsupported_configurations():
+    rng = np.random.default_rng(33)
+    W = np.exp(1j * rng.uniform(0, 2 * np.pi, (K, 64)))
+    with pytest.raises(ValueError):                       # b > 4 has no nibble
+        AngularHead(W, b=5, backend="neon", packed=True)
+    with pytest.raises(ValueError):                       # other backends
+        AngularHead(W, b=4, backend="angular_tiled", packed=True)
+    with pytest.raises(ValueError):                       # odd feature count
+        AngularHead(np.exp(1j * rng.uniform(0, 2 * np.pi, (K, 65))),
+                    b=4, backend="neon", packed=True)
+
+
+# ---------------------------------------------------------------------------
+# Group 6: the contract the MAC claim rests on
 # ---------------------------------------------------------------------------
 
 def test_mac_report_requires_phase_only(fixture):

@@ -104,6 +104,8 @@ __all__ = [
     "group_inv",
     "angular_distance",
     "quantize_unit",
+    "pack_indices",
+    "unpack_indices",
 ]
 
 # Fixed-point scale used for the int8 lookup tables consumed by the NEON
@@ -205,6 +207,43 @@ def angular_distance(k_a: np.ndarray, k_b: np.ndarray, b: int) -> np.ndarray:
     L = n_roots(b)
     d = np.abs(k_a.astype(np.int32) - k_b.astype(np.int32)) % L
     return np.minimum(d, L - d)
+
+
+def pack_indices(k: np.ndarray, b: int) -> np.ndarray:
+    """
+    Pack two b-bit indices per byte along the last axis. Requires b <= 4.
+
+    This is where the 32x weight compression lives: at b = 4 a phase index needs
+    a nibble, not a byte, so the head's weights halve again against the uint8
+    form. The last axis is zero-padded to an even length; index 0 is the group
+    identity, so a padded column contributes cos(0) = 1 and must be trimmed by
+    the caller rather than summed blindly.
+
+    Layout: low nibble is the even position, high nibble the odd one. The C
+    kernel's `angular_gemm_packed` assumes exactly this.
+    """
+    if b > 4:
+        raise ValueError(f"packing needs b <= 4 (two indices per byte), got b={b}")
+    k = np.ascontiguousarray(np.asarray(k, dtype=np.uint8))
+    if k.shape[-1] % 2:
+        pad = np.zeros(k.shape[:-1] + (1,), dtype=np.uint8)
+        k = np.concatenate([k, pad], axis=-1)
+    lo = k[..., 0::2] & np.uint8(0x0F)
+    hi = k[..., 1::2] & np.uint8(0x0F)
+    return np.ascontiguousarray((lo | (hi << np.uint8(4))).astype(np.uint8))
+
+
+def unpack_indices(packed: np.ndarray, b: int, width: int | None = None) -> np.ndarray:
+    """Inverse of pack_indices. `width` trims the padding column when odd."""
+    if b > 4:
+        raise ValueError(f"packing needs b <= 4, got b={b}")
+    packed = np.asarray(packed, dtype=np.uint8)
+    lo = packed & np.uint8(0x0F)
+    hi = packed >> np.uint8(4)
+    out = np.empty(packed.shape[:-1] + (2 * packed.shape[-1],), dtype=np.uint8)
+    out[..., 0::2] = lo
+    out[..., 1::2] = hi
+    return out if width is None else out[..., :width]
 
 
 def quantize_unit(w: np.ndarray, b: int, phase_only: bool = True) -> np.ndarray:
