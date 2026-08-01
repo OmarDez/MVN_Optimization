@@ -29,6 +29,44 @@ def test_checkpoint_roundtrip(tmp_path):
     assert ck.lift.kind == "minmax"
 
 
+def test_metadata_cannot_shadow_save_checkpoint_parameters(tmp_path):
+    """
+    Metadata is forwarded as **kwargs, so a meta key named after one of
+    save_checkpoint's own parameters collides with it. That is how the hybrid
+    branch of train_zoo.py died at the final line, after paying for the whole
+    training run: it passed lift=<LiftParams> positionally and lift=<str>
+    through **extra.
+
+    Guarding the contract rather than the caller: any meta key colliding with a
+    parameter name must fail loudly here, not in a script an hour in.
+    """
+    import inspect
+    reserved = set(inspect.signature(save_checkpoint).parameters) - {"meta"}
+    assert {"path", "W", "lift"} <= reserved
+
+    W = np.ones((2, 4), dtype=np.complex128)
+    lp = fit_lift(np.zeros((5, 3)), "minmax")
+    for name in ("lift", "W"):
+        with pytest.raises(TypeError):
+            save_checkpoint(tmp_path / "x.npz", W, lp, **{name: "collides"})
+
+
+def test_hybrid_checkpoint_save_path(tmp_path):
+    """The exact call shape train_zoo.py uses for backbone-based models."""
+    rng = np.random.default_rng(9)
+    Z = rng.normal(size=(64, 16))
+    lp = fit_lift(Z, "minmax")
+    W = np.exp(1j * rng.uniform(0, 2 * np.pi, (10, 17)))
+    p = save_checkpoint(tmp_path / "resnet18_mnist.npz", W, lp,
+                        backbone="resnet18", dataset="mnist",
+                        accuracy_fp32=0.97, epochs=5,
+                        feature_dim=16, fully_phase_native=False)
+    ck = load_checkpoint(p)
+    assert ck.lift.kind == "minmax"          # the lift kind survives without
+    assert ck.meta["backbone"] == "resnet18"  # a redundant meta key
+    assert ck.meta["fully_phase_native"] is False
+
+
 def test_checkpoint_has_no_pickle(tmp_path):
     """allow_pickle=False must suffice -- checkpoints carry no Python objects."""
     rng = np.random.default_rng(1)

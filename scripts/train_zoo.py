@@ -129,7 +129,11 @@ def main() -> int:
             head = MVNHead(Ctr.shape[1], 10).fit(Ctr, ytr, epochs=a.epochs)
             acc = head.accuracy(Cte, yte)
             W = head.W
-            extra = {"lift": a.lift, "feature_dim": int(Ztr.shape[1]),
+            # No "lift" key here: it would collide with save_checkpoint's own
+            # `lift` parameter through **extra. The kind is already serialized
+            # as part of LiftParams, so recording it again would be redundant
+            # as well as fatal.
+            extra = {"feature_dim": int(Ztr.shape[1]),
                      "fully_phase_native": False}
 
         out = pathlib.Path(a.outdir) / f"{model}_{a.dataset}.npz"
