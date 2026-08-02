@@ -7,7 +7,11 @@ dist/
 venv/
 kernels/*.so
 kernels/*.o
-data/
+# Anchored: this is the torchvision download directory at the repo root. An
+# unanchored `data/` also swallowed tests/data/, so the committed activation
+# fixture never reached CI and the E3 step died on a missing file while the
+# tests that need it quietly skipped.
+/data/
 .pytest_cache/
 .ipynb_checkpoints/
 results/smoke*.json
