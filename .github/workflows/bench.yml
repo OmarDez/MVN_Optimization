@@ -98,6 +98,24 @@ jobs:
             --bits 4 --batches 256 --repeat 30 \
             --out results/crossover-tail-${{ matrix.runner }}.json
 
+      # The phase-native input path, on the shapes where it matters most.
+      # Conversion is O(n*d) against O(n*k*d) of work, so its relative cost is
+      # ~1/k -- worst exactly where k is smallest, which is head_512x10, the
+      # shape this repository actually deploys and the one with the worst ratio.
+      # In practice it is worse than 1/k suggests, because np.angle plus
+      # phase_to_index costs far more per element than the kernel's inner loop
+      # costs per MAC. Measured without this, the head number is dominated by a
+      # conversion a phase-native front end would never perform.
+      - name: Pre-indexed input path
+        env:
+          PYMVN_THREADS: '1'
+        run: |
+          python bench/run_bench.py --synthetic \
+            --cases head_512x10 layer_2048x64 layer_4096x256 \
+            --backends onnx neon angular_tiled \
+            --bits 4 --batches 512 2048 --repeat 30 --pre-indexed \
+            --out results/preindexed-${{ matrix.runner }}.json
+
       # One real shape, to put the crossover on a scale a reader already has:
       # 4096x11008 is a Llama-7B FFN layer, 45.1M MACs per sample, 2.7x past the
       # measured crossover. Batch 64 because W alone is a 721 MiB complex128
