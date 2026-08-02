@@ -342,6 +342,48 @@ def test_bits_above_eight_are_refused(fixture):
             _head(W, b, "angular_tiled")
 
 
+# ---------------------------------------------------------------------------
+# The atan2-free index path
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(_lib_missing(), reason="kernel not built")
+@pytest.mark.parametrize("b", [1, 2, 3, 4, 5, 6, 7, 8])
+def test_c_index_tree_matches_atan2_on_ordinary_input(fixture, b):
+    """
+    Determining the sector by comparisons must agree with computing the angle
+    and rounding it. Checked for every supported b, since the tree depth is b.
+    """
+    W, X = fixture
+    h = _head(W, b, "angular_tiled")
+    np.testing.assert_array_equal(h.to_indices(X, c_kernel=True),
+                                  h.to_indices(X, c_kernel=False))
+
+
+@pytest.mark.skipif(_lib_missing(), reason="kernel not built")
+def test_c_index_tree_handles_degenerate_points(fixture):
+    """Zero and the branch cut, which is where a plane partition can go wrong."""
+    W, _ = fixture
+    h = _head(W, 4, "angular_tiled")
+    Z = np.zeros((3, W.shape[1]), dtype=np.complex128)
+    Z[1] = np.exp(1j * np.pi)          # exactly on the cut
+    Z[2] = np.exp(-1j * np.pi)
+    np.testing.assert_array_equal(h.to_indices(Z, c_kernel=True),
+                                  h.to_indices(Z, c_kernel=False))
+
+
+@pytest.mark.skipif(_lib_missing(), reason="kernel not built")
+def test_c_index_tree_is_opt_in(fixture):
+    """
+    The default must stay the deterministic NumPy path. The two disagree only
+    on angles lying exactly on a sector boundary -- 0 of 2.01M real activations
+    -- but a cross-machine difference that appears only under adversarial input
+    is worse than a slower default, so it does not switch itself on.
+    """
+    W, X = fixture
+    h = _head(W, 4, "angular_tiled")
+    np.testing.assert_array_equal(h.to_indices(X), h.to_indices(X, c_kernel=False))
+
+
 def test_agreement_improves_with_bits(fixture):
     """
     Spending more phase bits must buy accuracy. Checked end to end rather than

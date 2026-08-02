@@ -40,6 +40,7 @@
  * License: Apache-2.0
  */
 
+#include <math.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -192,6 +193,76 @@ void angular_gemm_packed(const uint8_t *kx, const uint8_t *kw_packed,
             acc_re[(size_t)i * k + j] = sre;
             acc_im[(size_t)i * k + j] = sim;
         }
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Complex activations -> phase indices, without ever forming an angle.      */
+/*                                                                           */
+/* This is the OTHER half of the multiplier-free story. The kernel above     */
+/* never multiplies, but getting into its index domain used to cost an       */
+/* atan2 per activation -- and at small k that dominated: for a 512x10 head  */
+/* the conversion was 48% of total time, because conversion is O(n*d) while  */
+/* the layer is only O(n*k*d).                                               */
+/*                                                                           */
+/* No angle is needed. The sector index is a partition of the plane, and its */
+/* boundaries ARE these inequalities, so the result is exact rather than     */
+/* approximate:                                                              */
+/*                                                                           */
+/*   rotate by pi/L    so wedge boundaries land on round-to-nearest cuts     */
+/*   sign(y)           -> half        (1 comparison)                         */
+/*   sign(x)           -> quadrant    (1 comparison)                         */
+/*   y vs tan(a)*x     -> subdivide   (1 comparison per remaining bit)       */
+/*                                                                           */
+/* b comparisons and b-2 rotations, all branch-free and register-resident,   */
+/* against one libm atan2. The same tree in NumPy is 2.25x SLOWER than       */
+/* atan2, because there each step is a separate pass over memory -- the win  */
+/* only exists once the point stays in registers, which is here.             */
+/*                                                                           */
+/* z is interleaved re/im, i.e. the memory layout of complex128.             */
+/* ------------------------------------------------------------------------ */
+void angular_phase_index(const double *z, uint8_t *out, int n, int b)
+{
+    const int L = 1 << b;
+    const double half = 3.14159265358979323846 / (double)L;
+    const double ch = cos(half), sh = sin(half);
+
+    /* Per-level rotation constants, levels j = 3..b. */
+    double ta[9], ca[9], sa[9];
+    for (int j = 3; j <= b && j <= 8; ++j) {
+        double a = 3.14159265358979323846 / (double)(1 << (j - 1));
+        ta[j] = tan(a); ca[j] = cos(a); sa[j] = sin(a);
+    }
+
+    /* Branchless throughout. The comparisons are data-dependent on essentially
+     * random phases, so every branch here would be a coin flip -- and a
+     * mispredict costs more than the whole tree. Selecting arithmetically keeps
+     * the pipeline full and is what lets this beat atan2 at all. */
+    for (int i = 0; i < n; ++i) {
+        const double re = z[2 * i], im = z[2 * i + 1];
+        double x = re * ch - im * sh;
+        double y = re * sh + im * ch;
+        int k = 0;
+
+        if (b >= 1) {                       /* half: negate if below the axis */
+            const double m = (y < 0.0) ? -1.0 : 1.0;
+            k |= (y < 0.0) ? (L >> 1) : 0;
+            x *= m; y *= m;
+        }
+        if (b >= 2) {                       /* quadrant: rotate by -pi/2 */
+            const int c = (x < 0.0);
+            const double nx = c ? y : x, ny = c ? -x : y;
+            k |= c ? (L >> 2) : 0;
+            x = nx; y = ny;
+        }
+        for (int j = 3; j <= b; ++j) {      /* subdivide: rotate by -pi/2^(j-1) */
+            const int c = (y > ta[j] * x);
+            const double nx = x * ca[j] + y * sa[j];
+            const double ny = -x * sa[j] + y * ca[j];
+            k |= c ? (L >> j) : 0;
+            x = c ? nx : x; y = c ? ny : y;
+        }
+        out[i] = (uint8_t)(k & (L - 1));
     }
 }
 

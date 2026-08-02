@@ -26,7 +26,7 @@ case "$ARCH" in
     ;;
 esac
 
-"$CC" "${FLAGS[@]}" "$HERE/angular_neon.c" -o "$HERE/libangular.so"
+"$CC" "${FLAGS[@]}" "$HERE/angular_neon.c" -o "$HERE/libangular.so" -lm
 echo "[build] wrote $HERE/libangular.so"
 
 python3 - <<'PY'

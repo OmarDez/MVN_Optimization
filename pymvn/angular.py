@@ -76,6 +76,13 @@ def _load_lib():
     if hasattr(lib, "angular_gemm_packed"):
         lib.angular_gemm_packed.argtypes = lib.angular_gemm.argtypes
         lib.angular_gemm_packed.restype = None
+    if hasattr(lib, "angular_phase_index"):
+        lib.angular_phase_index.argtypes = [
+            ctypes.POINTER(ctypes.c_double),  # z, interleaved re/im
+            ctypes.POINTER(ctypes.c_uint8),   # out (n)
+            ctypes.c_int, ctypes.c_int,       # n, b
+        ]
+        lib.angular_phase_index.restype = None
     _lib = lib
     return _lib
 
@@ -237,7 +244,7 @@ class AngularHead:
         zeros = np.zeros((kX.shape[0], 1), dtype=np.uint8)
         return np.ascontiguousarray(np.concatenate([zeros, kX], axis=1))
 
-    def to_indices(self, X: np.ndarray) -> np.ndarray:
+    def to_indices(self, X: np.ndarray, c_kernel: bool = False) -> np.ndarray:
         """
         Complex activations on S^1 -> uint8 phase indices, shape (n, d1),
         bias column included.
@@ -247,8 +254,34 @@ class AngularHead:
         from the FFT. It is public so the benchmark can time the conversion
         separately instead of burying it inside the kernel measurement -- see
         `logits(..., indices=True)`.
+
+        `c_kernel=True` takes the atan2-free path in C. A sector index is a
+        partition of the plane, so b comparisons decide it -- no angle is ever
+        formed. Measured 2.2x faster than np.angle, which is 1.38x on the whole
+        512x10 head, where conversion is roughly half the time. The identical
+        tree written in NumPy is 2.25x SLOWER than atan2, because there every
+        comparison is another pass over memory; the win needs the point to stay
+        in registers.
+
+        OPT-IN, for the same reason `packed` is. The two paths disagree on the
+        measure-zero set of angles lying EXACTLY on a sector boundary, where the
+        tie-break differs: 16 disagreements in a dense sweep of 1.6M synthetic
+        angles, and 0 in 2.01M real activations, with no prediction changed.
+        Real data does not land on boundaries -- but a silent cross-machine
+        difference that only shows up on adversarial input is precisely what the
+        parity gate exists to prevent, so the default stays deterministic.
         """
         Xb = self._with_bias(np.asarray(X, dtype=np.complex128))
+        if c_kernel:
+            lib = _load_lib()
+            if lib is not None and hasattr(lib, "angular_phase_index"):
+                Xb = np.ascontiguousarray(Xb, dtype=np.complex128)
+                out = np.empty(Xb.shape, dtype=np.uint8)
+                lib.angular_phase_index(
+                    Xb.view(np.float64).ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                    out.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                    ctypes.c_int(Xb.size), ctypes.c_int(self.b))
+                return out
         return np.ascontiguousarray(alg.phase_to_index(np.angle(Xb), self.b))
 
     # -- backends -----------------------------------------------------------

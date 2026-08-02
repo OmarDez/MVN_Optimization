@@ -129,6 +129,22 @@ def time_conversion(head: AngularHead, X: np.ndarray, repeat: int,
     return _time(lambda: head.to_indices(X), repeat, warmup)
 
 
+def time_conversion_c(head: AngularHead, X: np.ndarray, repeat: int,
+                      warmup: int) -> dict | None:
+    """
+    Same conversion, atan2-free, in C. Returns None when the kernel is absent.
+
+    Reported next to the NumPy figure rather than replacing it: the C path is
+    opt-in because the two disagree exactly on sector boundaries, so the honest
+    presentation is both numbers and the reason for the default.
+    """
+    from pymvn.angular import _load_lib
+    lib = _load_lib()
+    if lib is None or not hasattr(lib, "angular_phase_index"):
+        return None
+    return _time(lambda: head.to_indices(X, c_kernel=True), repeat, warmup)
+
+
 # ---------------------------------------------------------------------------
 # Workloads
 # ---------------------------------------------------------------------------
@@ -278,7 +294,7 @@ def main() -> int:
 
             for b in args.bits:
                 row = {}
-                convert_ms = None
+                convert_ms = convert_c_ms = None
                 for backend in backends:
                     head = AngularHead(W, b=b, backend=backend,
                                        tile=tuple(args.tile))
@@ -294,6 +310,9 @@ def main() -> int:
                             if convert_ms is None:
                                 convert_ms = time_conversion(
                                     head, X, args.repeat, args.warmup)["median_ms"]
+                                c = time_conversion_c(head, X, args.repeat,
+                                                      args.warmup)
+                                convert_c_ms = c["median_ms"] if c else None
                             Xin = head.to_indices(X)
                         else:
                             Xin = X
@@ -312,6 +331,7 @@ def main() -> int:
                         "agreement_vs_fp": float((pred == ref_pred).mean()),
                         "input_mode": "indices" if use_idx else "complex",
                         "convert_ms": convert_ms if use_idx else None,
+                        "convert_c_ms": convert_c_ms if use_idx else None,
                         **head.mac_report(), **stats, **host,
                     }
                     records.append(rec)
@@ -327,7 +347,9 @@ def main() -> int:
                     sp = f" ({base / ms:5.2f}x)" if base and backend != "onnx" else ""
                     parts.append(f"{backend}={ms:8.2f}ms{sp}")
                 if convert_ms is not None:
-                    parts.append(f"[convert={convert_ms:.2f}ms]")
+                    c = (f" C={convert_c_ms:.2f}ms "
+                         f"({convert_ms / convert_c_ms:.2f}x)") if convert_c_ms else ""
+                    parts.append(f"[convert={convert_ms:.2f}ms{c}]")
                 print(f"  {head_line}  " + "  ".join(parts), flush=True)
 
                 if base:

@@ -115,8 +115,9 @@ def table_preindexed(recs) -> str:
             if r["backend"] == "onnx"}
 
     out = ["| arch | model | k | b | batch | backend | kernel ms | convert ms "
-           "| complex-in ms | conversion was | ratio then | ratio now |",
-           "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+           "| convert (C, no atan2) | complex-in ms | conversion was "
+           "| ratio then | ratio now |",
+           "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in sorted(idx, key=lambda r: (r["arch"], r["n_classes"] * (r["d"] + 1),
                                         r["batch"], r["backend"])):
         conv = r["convert_ms"]
@@ -125,10 +126,12 @@ def table_preindexed(recs) -> str:
         if base is None:
             continue
         then, now = base["median_ms"] / total, base["median_ms"] / r["median_ms"]
+        cc = r.get("convert_c_ms")
+        ccol = f"{cc:.2f} ({conv / cc:.2f}x)" if cc else "-"
         out.append(f"| {r['arch']} | {r['model']} | {r['n_classes']} | {r['b']} "
                    f"| {r['batch']} | {r['backend']} | {r['median_ms']:.2f} "
-                   f"| {conv:.2f} | {total:.2f} | {conv / total * 100:.0f}% "
-                   f"| {then:.3f} | **{now:.3f}** |")
+                   f"| {conv:.2f} | {ccol} | {total:.2f} "
+                   f"| {conv / total * 100:.0f}% | {then:.3f} | **{now:.3f}** |")
     return "\n".join(out)
 
 
