@@ -285,6 +285,63 @@ def test_pruning_recovers_part_of_the_modulus_cost(trained):
     assert acc(prune_tau=0.06) > acc(), "pruning should beat the unpruned head"
 
 
+# ---------------------------------------------------------------------------
+# Group scales: the modulus, kept at block granularity
+# ---------------------------------------------------------------------------
+
+def test_groups_at_full_granularity_is_exactly_full_polar(fixture):
+    """
+    G = d1 gives every weight its own scale, so the group path must reproduce
+    full-polar EXACTLY -- same phases, same moduli, same arithmetic. Anything
+    else means the scales are not being applied where they belong.
+    """
+    W, X = fixture
+    h = _head(W, 4, "angular_naive", groups=W.shape[1])
+    kX = h.to_indices(X).astype(np.int64)
+    kW = h.kW.astype(np.int64)
+    ks = (kX[:, None, :] + kW[None, :, :]) & (h.L - 1)
+    from pymvn import algebra as alg
+    r = np.abs(W)[None]
+    want = ((r * alg.cos_lut(4)[ks]).sum(2) + 1j * (r * alg.sin_lut(4)[ks]).sum(2))
+    np.testing.assert_allclose(h.logits(X), want, atol=1e-12)
+
+
+def test_groups_zero_is_a_noop(fixture):
+    W, X = fixture
+    np.testing.assert_array_equal(_head(W, 4, "angular_tiled", groups=0).logits(X),
+                                  _head(W, 4, "angular_tiled").logits(X))
+
+
+def test_groups_rejects_full_polar_and_out_of_range(fixture):
+    W, _ = fixture
+    with pytest.raises(ValueError):      # full-polar already keeps every modulus
+        _head(W, 4, "angular_tiled", groups=8, phase_only=False)
+    with pytest.raises(ValueError):
+        _head(W, 4, "angular_tiled", groups=W.shape[1] + 1)
+
+
+def test_group_scales_survive_the_tiling_schedule(fixture):
+    """Tile size must not change grouped results either."""
+    W, X = fixture
+    ref = _head(W, 4, "angular_tiled", groups=16, tile=(64, 256)).logits(X)
+    for tile in [(16, 64), (32, 128), (128, 512)]:
+        np.testing.assert_allclose(
+            _head(W, 4, "angular_tiled", groups=16, tile=tile).logits(X),
+            ref, atol=1e-9)
+
+
+def test_bits_above_eight_are_refused(fixture):
+    """
+    Phase indices are uint8. At b > 8 they wrap silently and every angular
+    backend returns a plausible wrong answer -- so the constructor must refuse
+    rather than let that happen.
+    """
+    W, _ = fixture
+    for b in (9, 12, 16):
+        with pytest.raises(ValueError, match="uint8"):
+            _head(W, b, "angular_tiled")
+
+
 def test_agreement_improves_with_bits(fixture):
     """
     Spending more phase bits must buy accuracy. Checked end to end rather than

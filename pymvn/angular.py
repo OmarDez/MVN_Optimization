@@ -46,6 +46,9 @@ BACKENDS = (
     "neon",
 )
 
+# Phase indices are uint8 end to end, so 2^b - 1 must fit in a byte.
+MAX_BITS = 8
+
 _LIB_PATH = pathlib.Path(__file__).resolve().parent.parent / "kernels" / "libangular.so"
 _lib = None
 
@@ -102,12 +105,23 @@ class AngularHead:
 
     def __init__(self, W: np.ndarray, b: int = 4, backend: str = "complex128",
                  phase_only: bool = True, tile: tuple[int, int] = (64, 256),
-                 packed: bool = False, prune_tau: float = 0.0):
+                 packed: bool = False, prune_tau: float = 0.0,
+                 groups: int = 0, scale_pow2: bool = False):
         if backend not in BACKENDS:
             raise ValueError(f"backend must be one of {BACKENDS}, got {backend!r}")
         self.W_fp = np.asarray(W, dtype=np.complex128)
         self.n_classes, self.d1 = self.W_fp.shape
         self.b = int(b)
+        if not 1 <= self.b <= MAX_BITS:
+            # Phase indices are uint8 all the way through -- that is the operand
+            # type `vqtbl1q_u8` consumes and what makes the index array 8x
+            # smaller than int64. At b > 8 an index reaches 2^b - 1 > 255 and
+            # wraps SILENTLY, so every angular backend returns a plausible wrong
+            # answer. Refuse instead: b > 8 is far past the b = 3..4 the model
+            # needs (E3), so nothing is lost by making the limit explicit.
+            raise ValueError(
+                f"b must be in [1, {MAX_BITS}]: phase indices are uint8 and "
+                f"b={self.b} would need {alg.n_roots(self.b)} of them")
         self.L = alg.n_roots(self.b)
         self.backend = backend
         self.phase_only = bool(phase_only)
@@ -147,6 +161,53 @@ class AngularHead:
                 )
         self.packed = bool(packed)
         self.kW_packed = alg.pack_indices(self.kW, self.b) if packed else None
+
+        # ------------------------------------------------------------------
+        # Group scales. phase_only sends every r_ji to 1, which is the brutal
+        # extreme of a knob that has a middle. The modulus factors out of the
+        # sum, so grouping the inputs and sharing one scale per group,
+        #
+        #     z_j = sum_g r_jg * sum_{i in g} e^{i(phi_ji + theta_i)}
+        #                        \___________________________________/
+        #                            still pure angular: add + vqtbl1q_u8
+        #
+        # leaves the INNER LOOP COMPLETELY UNCHANGED and costs G real multiplies
+        # per output neuron, at the very end. For layer_4096x256 with G=32 that
+        # is 8,192 multiplies against 1,048,832 MACs -- 0.8% -- and 8 KiB of
+        # int8 scales against 512 KiB of weights.
+        #
+        # This is block-wise quantization (GPTQ/AWQ group size) carried into the
+        # angular domain, and it attacks the diagnosed cause directly: |W| spans
+        # three orders of magnitude, and G=1 collapses all of it to one number.
+        #
+        # G=0 disables it, G=1 is one scale per output neuron, G=d1 is
+        # full-polar exactly. Least squares picks the arithmetic mean of the
+        # moduli in each group: minimizing sum (r_ji - r_jg)^2 over r_jg.
+        self.groups = int(groups)
+        self.scale_pow2 = bool(scale_pow2)
+        self.scales = None
+        self.group_starts = None
+        if self.groups:
+            if not self.phase_only:
+                raise ValueError("groups= only applies when phase_only=True; "
+                                 "full-polar already keeps every modulus")
+            if not 1 <= self.groups <= self.d1:
+                raise ValueError(f"groups must be in [1, {self.d1}], "
+                                 f"got {self.groups}")
+            self.group_starts = np.linspace(0, self.d1, self.groups + 1,
+                                            dtype=int)[:-1]
+            r = np.where(self.keep, np.abs(self.W_fp), 0.0)
+            cnt = np.add.reduceat(self.keep.astype(np.float64),
+                                  self.group_starts, axis=1)
+            tot = np.add.reduceat(r, self.group_starts, axis=1)
+            self.scales = np.divide(tot, cnt, out=np.ones_like(tot),
+                                    where=cnt > 0)
+            if self.scale_pow2:
+                # Rounding the scales to powers of two turns the final multiply
+                # into a shift, so the datapath stays free of real multipliers
+                # rather than "free except for G*k of them".
+                e = np.round(np.log2(np.maximum(self.scales, 1e-300)))
+                self.scales = np.exp2(e)
 
         self._ort_sess = None  # built lazily
 
@@ -255,6 +316,17 @@ class AngularHead:
         return ort.InferenceSession(model.SerializeToString(), so,
                                     providers=["CPUExecutionProvider"])
 
+    def _combine_groups(self, gre: np.ndarray, gim: np.ndarray) -> np.ndarray:
+        """
+        Apply the per-group scales and reduce, given (n, k, G) partial sums.
+
+        These are the only real multiplies in the whole head, G*k of them per
+        sample, and they happen once at the end rather than once per MAC. With
+        `scale_pow2` they are shifts and there are none.
+        """
+        sc = self.scales[None, :, :]
+        return (gre * sc).sum(axis=2) + 1j * (gim * sc).sum(axis=2)
+
     def _z_angular_naive(self, kX: np.ndarray) -> np.ndarray:
         """
         Direct transcription of the isomorphism. Materializes the full
@@ -270,6 +342,10 @@ class AngularHead:
         if self.prune_tau > 0:
             keep = self.keep[None, :, :]
             cv, sv = np.where(keep, cv, 0.0), np.where(keep, sv, 0.0)
+        if self.groups:
+            return self._combine_groups(
+                np.add.reduceat(cv, self.group_starts, axis=2),
+                np.add.reduceat(sv, self.group_starts, axis=2))
         return cv.sum(axis=2) + 1j * sv.sum(axis=2)
 
     def _z_angular_tiled(self, kX: np.ndarray) -> np.ndarray:
@@ -293,14 +369,25 @@ class AngularHead:
         c8 = alg.cos_lut_i8(self.b)
         s8 = alg.sin_lut_i8(self.b)
 
-        acc_re = np.zeros((n, k), dtype=np.int32)
-        acc_im = np.zeros((n, k), dtype=np.int32)
         tn, td = self.tile
+        # With group scales the feature axis is blocked on GROUP boundaries
+        # rather than on `td`, so each block lands in exactly one accumulator
+        # slot. Tile size remains a pure schedule knob either way: it cannot
+        # change the result, which `test_tiling_is_schedule_invariant` enforces.
+        if self.groups:
+            spans = list(zip(self.group_starts,
+                             list(self.group_starts[1:]) + [d1]))
+        else:
+            spans = [(j0, min(j0 + td, d1)) for j0 in range(0, d1, td)]
+
+        G = self.groups or 1
+        acc_re = np.zeros((n, k, G), dtype=np.int32)
+        acc_im = np.zeros((n, k, G), dtype=np.int32)
 
         for i0 in range(0, n, tn):
             i1 = min(i0 + tn, n)
-            for j0 in range(0, d1, td):
-                j1 = min(j0 + td, d1)
+            for g, (j0, j1) in enumerate(spans):
+                slot = g if self.groups else 0
                 # (tn, k, td) index block, uint8 throughout.
                 blk = (kX[i0:i1, None, j0:j1] + kW[None, :, j0:j1]) & mask
                 cv, sv = c8[blk], s8[blk]
@@ -309,11 +396,13 @@ class AngularHead:
                     # multiplier-free at the cost of one mask bit per weight.
                     keep = self.keep[None, :, j0:j1]
                     cv, sv = np.where(keep, cv, np.int8(0)), np.where(keep, sv, np.int8(0))
-                acc_re[i0:i1] += cv.sum(axis=2, dtype=np.int32)
-                acc_im[i0:i1] += sv.sum(axis=2, dtype=np.int32)
+                acc_re[i0:i1, :, slot] += cv.sum(axis=2, dtype=np.int32)
+                acc_im[i0:i1, :, slot] += sv.sum(axis=2, dtype=np.int32)
 
         scale = 1.0 / alg.LUT_SCALE_I8
-        return acc_re * scale + 1j * (acc_im * scale)
+        if self.groups:
+            return self._combine_groups(acc_re * scale, acc_im * scale)
+        return acc_re[:, :, 0] * scale + 1j * (acc_im[:, :, 0] * scale)
 
     def _z_neon(self, kX: np.ndarray) -> np.ndarray:
         """Hand-written C kernel using the AArch64 TBL instruction."""
@@ -326,6 +415,13 @@ class AngularHead:
             raise NotImplementedError(
                 "prune_tau is implemented in the NumPy backends only; use "
                 "backend='angular_tiled' to measure pruning")
+        if self.groups:
+            # Same reasoning. The kernel would need per-group accumulators and
+            # a scaling epilogue; the inner loop itself is unchanged, which is
+            # the whole point of the scheme.
+            raise NotImplementedError(
+                "groups= is implemented in the NumPy backends only; use "
+                "backend='angular_tiled' to measure group scales")
         lib = _load_lib()
         if lib is None:
             raise RuntimeError(

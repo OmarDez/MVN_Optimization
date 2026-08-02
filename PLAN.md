@@ -428,6 +428,64 @@ is not the elegant one:
 amplifies.** The manifold is the right description of the state space and the
 wrong constraint to impose during training.
 
+### E3d — Group scales (negative result)
+
+If the modulus is worth 2.6 points at inference, why discard *all* of it?
+The modulus factors out of the sum, so grouping the inputs and sharing one
+scale per group leaves the inner loop untouched:
+
+$$z_j \;=\; \sum_{g=1}^{G} r_{jg} \underbrace{\sum_{i \in g} e^{i(\phi_{ji} + \theta_i)}}_{\text{still add} + \texttt{vqtbl1q\_u8}}$$
+
+This is block-wise quantization — the GPTQ/AWQ group size — carried into the
+angular domain. `groups=G` implements it, and the accounting is attractive:
+for `layer_4096x256` at G = 32 it is 8,192 real multiplies against 1,048,832
+MACs (0.8 %) and 8 KiB of scales against 512 KiB of weights. `scale_pow2`
+rounds the scales to powers of two so even those become shifts.
+
+*Correct, and it does not work.* G = d1 reproduces full-polar to 0.0e+00
+(machine-checked), so the implementation is right. The prediction was that
+G = 32 recovers ≥ 2.0 of the 2.6 points. Measured on the checkpoint at b = 4:
+
+| G | group size | recovered | with `scale_pow2` |
+|---|---|---|---|
+| 1 | 201 | −4.6 % | −140 % |
+| 8 | 25 | −38.5 % | −58 % |
+| 32 | 6.3 | **−79.5 %** | −106 % |
+| 64 | 3.1 | −8.8 % | −29 % |
+| 128 | 1.6 | **+92.6 %** | +43 % |
+| 201 | 1.0 | +95.1 % | +30 % |
+
+Coarse grouping is *worse than discarding the modulus entirely*, and the curve
+only turns useful once the group is essentially one weight — at which point you
+are storing a scale per weight, which is full-polar wearing a hat. Combining it
+with pruning does not rescue it (worse at every G), and neither does a better
+estimator: median beats mean everywhere, as heavy tails imply, and still only
+reaches +1 % at G = 32 and +39 % at G = 64.
+
+*Mechanism.* Blocking works in GPTQ/AWQ because weights within a block share
+magnitude structure, put there by weight decay, layer norm and channel scaling.
+MVN error correction puts none there. Measured on `log10|W|`:
+
+| G | within-group variance captured |
+|---|---|
+| 8 | 4.7 % |
+| 32 | **14.7 %** |
+| 128 | 53.0 % |
+
+And **shuffling the input axis leaves it unchanged** (0.0950 → 0.0926 at
+G = 32): there is no locality along the feature axis to exploit. The modulus
+distribution is heavy-tailed and unstructured, so no coarse blocking can
+summarize it, whatever the estimator.
+
+So the ranking from E3b stands and pruning remains the best multiplier-free
+option at 0.9089. The technique is kept because the sweep is the evidence, and
+`groups=` is the mechanism a reader would otherwise propose.
+
+*Found on the way.* `AngularHead` cast phase indices to `uint8` unconditionally,
+so at b > 8 they wrapped **silently** and every angular backend returned a
+plausible wrong answer. The tests only ever swept b ∈ {3,4,5,6}, so nothing
+caught it. `b` is now validated against `MAX_BITS = 8`.
+
 ### E4 — Tile-size sweep
 
 *Hypothesis.* Blocking so the working set fits L1D (typically 64 KiB on
