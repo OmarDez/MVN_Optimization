@@ -56,10 +56,24 @@ def load_dataset(name: str):
     return Xtr, ytr, Xte, yte, (28, 28)
 
 
-def backbone_features(model: str, Xtr, Xte, shape):
-    """Return real-valued features from a torch backbone."""
+def backbone_features(model: str, Xtr, Xte, shape, seed: int = 0):
+    """
+    Return real-valued features from a torch backbone.
+
+    The backbone is constructed with weights=None and never trained: these are
+    RANDOM convolutional projections, and the MVN head is the only thing that
+    learns. That is a deliberate lower bound on the head -- whatever accuracy it
+    reaches here, it reaches without help from the feature extractor -- but it
+    is not the setting PLAN.md 3.2 quotes, so do not compare the two numbers.
+
+    Seeded because of it. An unseeded random backbone makes the checkpoint
+    irreproducible: the head weights would refer to features nobody can
+    regenerate. The seed goes into the checkpoint metadata.
+    """
     import torch, torch.nn as nn
     from torchvision import models
+
+    torch.manual_seed(seed)
 
     H, W = shape
     to_t = lambda X: torch.tensor(X, dtype=torch.float32).reshape(-1, 1, H, W) / 255.0
@@ -99,6 +113,8 @@ def main() -> int:
     ap.add_argument("--epochs", type=int, default=5)
     ap.add_argument("--hidden", type=int, default=200)
     ap.add_argument("--freq-size", type=int, default=12)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="backbone init seed; recorded in the checkpoint")
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--outdir", default="models")
     a = ap.parse_args()
@@ -118,12 +134,15 @@ def main() -> int:
             net = MLMVN(Ctr.shape[1], a.hidden, 10)
             net.fit(Ctr, ytr, epochs=a.epochs)
             acc = net.accuracy(Cte, yte)
-            # Freeze the OUTPUT layer as the benchmarked head.
-            W, lp = net.W2, None
+            # Freeze the OUTPUT layer as the benchmarked head -- and W1 with it.
+            # The head alone cannot reproduce the accuracy recorded below,
+            # because the activations it expects come out of the hidden layer.
+            W, lp, W_hidden = net.W2, None, net.W1
             extra = {"hidden": a.hidden, "freq_size": a.freq_size,
                      "encoding": "fft_phase_only", "fully_phase_native": True}
         else:
-            Ztr, Zte = backbone_features(model, Xtr, Xte, shape)
+            W_hidden = None
+            Ztr, Zte = backbone_features(model, Xtr, Xte, shape, seed=a.seed)
             lp = fit_lift(Ztr, a.lift)
             Ctr, Cte = lift(Ztr, lp), lift(Zte, lp)
             head = MVNHead(Ctr.shape[1], 10).fit(Ctr, ytr, epochs=a.epochs)
@@ -134,10 +153,13 @@ def main() -> int:
             # as part of LiftParams, so recording it again would be redundant
             # as well as fatal.
             extra = {"feature_dim": int(Ztr.shape[1]),
+                     "backbone_seed": int(a.seed),
+                     "backbone_trained": False,
                      "fully_phase_native": False}
 
         out = pathlib.Path(a.outdir) / f"{model}_{a.dataset}.npz"
-        save_checkpoint(out, W, lp, backbone=model, dataset=a.dataset,
+        save_checkpoint(out, W, lp, W_hidden=W_hidden,
+                        backbone=model, dataset=a.dataset,
                         accuracy_fp32=float(acc), epochs=a.epochs, **extra)
         print(f"  test accuracy {acc:.4f}  [{time.time() - t0:.1f}s]  -> {out}")
 

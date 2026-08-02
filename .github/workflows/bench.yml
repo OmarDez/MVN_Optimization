@@ -66,7 +66,7 @@ jobs:
             --out results/bench-${{ matrix.runner }}.json
 
       # Crossover hunt: the neon/onnx ratio climbs monotonically with layer size
-      # but is still below 1.0 at the largest shape here (0.891 on Neoverse N2).
+      # but is still below 1.0 at the largest shape here (0.887 on Neoverse N2).
       # angular_tiled is excluded deliberately -- it needs ~10.7s per iteration
       # at 4096x256 already, so it would dominate the wall time while telling us
       # nothing new.
@@ -81,12 +81,13 @@ jobs:
             --bits 4 --batches 2048 --repeat 30 \
             --out results/crossover-${{ matrix.runner }}.json
 
-      # The two shapes that straddle the revised parity estimate (~8.8M MACs per
-      # sample). Swept at batch 256 rather than 2048 because the ratio is a
-      # function of shape alone -- measured stable to within a few percent across
-      # batch 64/512/2048 -- so the small batch buys an 8x cheaper measurement of
-      # the same quantity. At batch 2048 layer_16384x1024 would cost ~7 minutes
-      # per cell and half a gigabyte of complex128 activations.
+      # The two shapes that bracket parity: 0.961 and 1.016, so the crossover
+      # lands between 9.4M and 16.8M MACs per sample. Swept at batch 256 rather
+      # than 2048 because the ratio is a function of shape alone -- measured
+      # stable to within a few percent across batch 64/512/2048 -- so the small
+      # batch buys an 8x cheaper measurement of the same quantity. At batch 2048
+      # layer_16384x1024 would cost ~7 minutes per cell and half a gigabyte of
+      # complex128 activations.
       - name: Crossover tail (largest shapes, small batch)
         env:
           PYMVN_THREADS: '1'

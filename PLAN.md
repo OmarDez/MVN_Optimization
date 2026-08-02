@@ -24,9 +24,9 @@ structure. This project makes that claim executable, measurable and falsifiable.
 | # | Claim | Status |
 |---|---|---|
 | C1 | Weight×activation in μ_L is exactly integer addition mod L | **Proved and machine-checked** (`tests/test_algebra.py`) |
-| C2 | Phase weights need ≤ 4 bits to match the unquantized baseline | To be measured — Experiment E3 |
+| C2 | Phase weights need ≤ 4 bits to match the unquantized baseline | **Measured on a real checkpoint** — b = 4 is within 0.0004 of b = 8 (E3) |
 | C3 | The head's weight footprint shrinks 8–16× versus deployed fp32 | To be measured — Experiment E5 |
-| C4 | Inference requires zero real multiplies in the head | Architecturally true; verified by `mac_report()` |
+| C4 | Inference requires zero real multiplies in the head | Architecturally true; verified by `mac_report()`. Costs 2.8 accuracy points on the MLMVN checkpoint — see E3 |
 | C5 | The angular kernel outperforms a tuned BLAS GEMM in throughput | **Not claimed.** See §7 |
 
 C5 is stated as a non-claim on purpose. Section 7 explains why, and what
@@ -294,6 +294,39 @@ Run **on Arm**, not x86.
 *Deliverable.* `docs/fig_bitwidth_ablation.png`. **This is the most important
 figure in the submission.**
 
+*Result* (`scripts/ablate_bits.py`, `mlmvn_fft_mnist.npz`, 10 000 MNIST test
+samples — real activations, not random points on S¹). **Not falsified.** Both
+halves of the hypothesis hold:
+
+| b | L | phase-only | full-polar | modulus costs | agreement vs b=8 |
+|---|---|---|---|---|---|
+| 1 | 2 | 0.7740 | 0.8238 | +0.0498 | 0.8021 |
+| 2 | 4 | 0.8402 | 0.9046 | +0.0644 | 0.8965 |
+| 3 | 8 | 0.8827 | 0.9167 | +0.0340 | 0.9614 |
+| **4** | **16** | **0.8920** | **0.9203** | +0.0283 | 0.9792 |
+| 6 | 64 | 0.8928 | 0.9205 | +0.0277 | 0.9949 |
+| 8 | 256 | 0.8922 | 0.9207 | +0.0285 | 0.9991 |
+
+b = 4 is within 0.0004 of b = 8 in full-polar and within 0.0005 phase-only.
+Nothing above b = 4 buys anything, so §2.4 survives: the precision the model
+needs really is the width of one NEON register.
+
+**The separate finding, which is a caveat on C3 rather than on C2.** Discarding
+the modulus — the thing that makes the datapath multiplier-free — costs a
+consistent **2.8 points** on this checkpoint (0.9203 → 0.8920 at b = 4). The
+reason is that the trained weights are not unit-modulus at all: |W| spans
+0.0015 to 2.0771. MVN theory assumes they are, but `MLMVN`'s additive
+error-correction update does not preserve it.
+
+Hard-projecting back onto the unit circle after every update does make
+phase-only free — the gap closes to *exactly* 0.0000, as it must — but the
+model it produces is worse overall than the one whose modulus is then thrown
+away (0.8135 against 0.8571 at 3 epochs). So the projection is not the fix. A
+training rule that *learns* unit-modulus weights, by updating the phase directly
+instead of projecting after an additive step, is the open question. Until then,
+the multiplier-free claim is architecturally exact and carries a measured
+~2.8-point accuracy cost that should be quoted with it.
+
 ### E4 — Tile-size sweep
 
 *Hypothesis.* Blocking so the working set fits L1D (typically 64 KiB on
@@ -378,6 +411,29 @@ data reuse** — a good GEMM keeps a tile of C in registers and streams A and B.
 NEON's 16-wide `TBL` buys roughly 16× over scalar, which lands the kernel near
 **parity** with BLAS, not ahead of it. Beating a tuned GEMM on raw throughput is
 not achievable on this timeline and should not be attempted.
+
+**Measured on Arm afterwards (Neoverse N2, `ubuntu-24.04-arm`, b = 4, single
+thread), which confirms the prediction and locates parity exactly:**
+
+```
+shape              MACs/sample   neon/onnx
+head_512x10              5,130     0.158     <- the head this repo deploys
+layer_4096x256       1,048,832     0.707
+layer_8192x512       4,194,816     0.887
+layer_12288x768      9,437,952     0.961
+layer_16384x1024    16,778,240     1.016     <- crossover
+```
+
+The ratio does cross 1.0, and the margin is outside the noise (697.9 ± 1.35 ms
+for `onnx` against 687.1 ± 0.61 ms for `neon` over 30 repetitions). But the
+log-log slope decays monotonically — 0.26, 0.32, 0.16, 0.17, 0.10, 0.10 — so
+parity is approached asymptotically, and it arrives roughly 3000× in per-sample
+MACs above the 512×10 head that is actually deployed. The claim table below is
+unchanged by this: "near parity at absurd layer sizes" is not "beats BLAS."
+
+The same sweep on x86_64 is flat at 0.047–0.059 across all seven shapes, which
+is the control — without `vqtbl1q_u8` the kernel is scalar C, and the entire
+Arm curve is attributable to the table-lookup datapath.
 
 ### The reframe
 

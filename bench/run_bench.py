@@ -161,22 +161,28 @@ def synthetic_cases(seed: int = 0, only: set[str] | None = None):
 
     Indexing by MACs PER SAMPLE, (d+1)*k, for the same reason:
 
-        shape             MACs/sample   neon/onnx
-        head_512x10             5,130     0.170   measured
-        layer_2048x64         131,136     0.377   measured
-        layer_4096x256      1,048,832     0.712   measured
-        layer_6144x384      2,359,680     0.803   measured
-        layer_8192x512      4,194,816     0.891   measured
-        layer_12288x768     9,437,952     ~1.01   projected
-        layer_16384x1024   16,778,240     ~1.11   projected
+        shape             MACs/sample   neon/onnx   (Neoverse N2, b=4)
+        head_512x10             5,130     0.158
+        layer_2048x64         131,136     0.362
+        layer_4096x256      1,048,832     0.707
+        layer_6144x384      2,359,680     0.805
+        layer_8192x512      4,194,816     0.887
+        layer_12288x768     9,437,952     0.961
+        layer_16384x1024   16,778,240     1.016   <-- crossover
 
-    The growth is monotone but DECELERATING: the log-log slope falls from ~0.28
-    over the first three points to ~0.16 over the last three, which moves
-    projected parity out from ~4.2M to ~8.8M MACs/sample. The final two shapes
-    straddle that revised estimate rather than confirming the original one.
+    So the ratio DOES cross 1.0, at ~1.7e7 MACs per sample. The margin is small
+    but not noise: 697.9 +- 1.35 ms for onnx against 687.1 +- 0.61 ms for neon
+    over 30 repetitions, and neon's p95 still beats onnx's fastest run.
 
-    If the ratio flattens below 1.0 instead, the kernel went memory-bound before
-    catching BLAS -- an equally reportable result, since it bounds the ceiling.
+    Read it with the growth curve, though. The log-log slope decays the whole
+    way -- 0.26, 0.32, 0.16, 0.17, 0.10, 0.10 -- so parity is approached
+    asymptotically, and crossing happens roughly 3000x (in per-sample MACs)
+    above the 512x10 head this repository actually deploys, where the ratio is
+    0.158. This measures where the angular datapath stops losing; it does not
+    make "faster than BLAS" a claim about any deployable head. See PLAN.md 7.
+
+    x86_64 is the control: flat at 0.047-0.059 across all seven shapes, since
+    without vqtbl1q_u8 the kernel falls back to scalar C.
     """
     for i, (name, d, k) in enumerate(SYNTHETIC_SHAPES):
         if only is not None and name not in only:

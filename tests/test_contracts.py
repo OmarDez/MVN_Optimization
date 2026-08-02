@@ -67,6 +67,50 @@ def test_hybrid_checkpoint_save_path(tmp_path):
     assert ck.meta["fully_phase_native"] is False
 
 
+def test_hidden_layer_is_an_additive_extension(tmp_path):
+    """
+    W_hidden_* may be stored, and storing it must not change how anything else
+    reads the file. Both directions matter: a checkpoint written without it
+    still loads (older files, and every hybrid model), and one written with it
+    is still a valid plain head.
+    """
+    rng = np.random.default_rng(11)
+    W = np.exp(1j * rng.uniform(0, 2 * np.pi, (10, 201)))
+    W1 = np.exp(1j * rng.uniform(0, 2 * np.pi, (200, 145)))
+
+    plain = load_checkpoint(save_checkpoint(tmp_path / "a.npz", W, None))
+    assert plain.W_hidden is None                     # absent, not an error
+
+    full = load_checkpoint(save_checkpoint(tmp_path / "b.npz", W, None,
+                                           W_hidden=W1))
+    np.testing.assert_allclose(full.W_hidden, W1, atol=1e-12)
+    np.testing.assert_allclose(full.W, plain.W, atol=1e-12)  # head unchanged
+    assert full.n_classes == plain.n_classes and full.d1 == plain.d1
+
+
+def test_mlmvn_checkpoint_reproduces_its_own_accuracy(tmp_path):
+    """
+    The reason W_hidden exists. A stored MLMVN must be able to regenerate the
+    activations its head expects -- otherwise accuracy_fp32 is a number nobody
+    can check, and the head can only ever be fed random points on S^1.
+    """
+    from pymvn import MLMVN
+    rng = np.random.default_rng(12)
+    C = np.exp(1j * rng.uniform(0, 2 * np.pi, (60, 24)))
+    y = rng.integers(0, 3, 60)
+
+    net = MLMVN(24, 16, 3)
+    net.fit(C, y, epochs=1)
+    acc = net.accuracy(C, y)
+
+    ck = load_checkpoint(save_checkpoint(tmp_path / "m.npz", net.W2, None,
+                                         W_hidden=net.W1,
+                                         accuracy_fp32=float(acc)))
+    back = MLMVN(24, 16, 3)
+    back.W1, back.W2 = ck.W_hidden, ck.W
+    assert back.accuracy(C, y) == ck.meta["accuracy_fp32"]
+
+
 def test_checkpoint_has_no_pickle(tmp_path):
     """allow_pickle=False must suffice -- checkpoints carry no Python objects."""
     rng = np.random.default_rng(1)
