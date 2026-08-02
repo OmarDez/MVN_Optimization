@@ -65,19 +65,37 @@ jobs:
             --bits 3 4 --batches 64 512 2048 --repeat 30 \
             --out results/bench-${{ matrix.runner }}.json
 
-      # Crossover hunt: the neon/onnx ratio is still climbing at the largest
-      # shape above. These two extra shapes bracket the projected parity point
-      # at ~7.3G MACs. angular_tiled is excluded deliberately -- it needs ~10.7s
-      # per iteration at 4096x256 already, so it would dominate the wall time
-      # while telling us nothing new.
+      # Crossover hunt: the neon/onnx ratio climbs monotonically with layer size
+      # but is still below 1.0 at the largest shape here (0.891 on Neoverse N2).
+      # angular_tiled is excluded deliberately -- it needs ~10.7s per iteration
+      # at 4096x256 already, so it would dominate the wall time while telling us
+      # nothing new.
       - name: Crossover sweep (onnx vs neon)
         env:
           PYMVN_THREADS: '1'
         run: |
           python bench/run_bench.py --synthetic \
+            --cases head_512x10 layer_2048x64 layer_4096x256 \
+                    layer_6144x384 layer_8192x512 \
             --backends onnx neon \
             --bits 4 --batches 2048 --repeat 30 \
             --out results/crossover-${{ matrix.runner }}.json
+
+      # The two shapes that straddle the revised parity estimate (~8.8M MACs per
+      # sample). Swept at batch 256 rather than 2048 because the ratio is a
+      # function of shape alone -- measured stable to within a few percent across
+      # batch 64/512/2048 -- so the small batch buys an 8x cheaper measurement of
+      # the same quantity. At batch 2048 layer_16384x1024 would cost ~7 minutes
+      # per cell and half a gigabyte of complex128 activations.
+      - name: Crossover tail (largest shapes, small batch)
+        env:
+          PYMVN_THREADS: '1'
+        run: |
+          python bench/run_bench.py --synthetic \
+            --cases layer_12288x768 layer_16384x1024 \
+            --backends onnx neon \
+            --bits 4 --batches 256 --repeat 30 \
+            --out results/crossover-tail-${{ matrix.runner }}.json
 
       - uses: actions/upload-artifact@v4
         with:

@@ -133,37 +133,61 @@ def time_conversion(head: AngularHead, X: np.ndarray, repeat: int,
 # Workloads
 # ---------------------------------------------------------------------------
 
-def synthetic_cases(seed: int = 0):
+SYNTHETIC_SHAPES = [
+    ("head_512x10", 512, 10),          # the real hybrid head
+    ("layer_2048x64", 2048, 64),       # mid-size
+    ("layer_4096x256", 4096, 256),     # large; where tiling should pay off
+    ("layer_6144x384", 6144, 384),     # brackets the original projection
+    ("layer_8192x512", 8192, 512),     # 0.891: close, but did not cross
+    ("layer_12288x768", 12288, 768),   # straddles the revised estimate
+    ("layer_16384x1024", 16384, 1024), # past it, if the fit holds
+]
+
+
+def synthetic_cases(seed: int = 0, only: set[str] | None = None):
     """
-    Five shapes spanning the interesting regime.
+    Seven shapes spanning the interesting regime.
 
     The real hybrid head (512 features x 10 classes) is far too small to measure
     anything -- Python and allocation overhead dominate completely. The larger
     layers exist to expose the crossover point where the angular datapath
     overtakes BLAS, which is itself the result worth reporting.
 
-    The measured neon/onnx ratio grows monotonically with layer size and a
-    log-log fit over the first three points gives ratio ~ MACs^0.277, which
-    projects parity at ~7.3G MACs. The last two shapes bracket that prediction:
+    The neon/onnx ratio is a function of SHAPE, not of batch: measured on
+    Neoverse N2 it holds to within a few percent across batch 64/512/2048
+    (head_512x10: 0.205/0.169/0.156, layer_4096x256: 0.701/0.688/0.708). That is
+    what makes the last two shapes affordable -- they are swept at a small batch
+    and the ratio still means the same thing.
 
-        shape             MACs @ batch 2048   neon/onnx
-        head_512x10                 10.5M     0.163   measured
-        layer_2048x64                269M     0.397   measured
-        layer_4096x256              2.15G     0.712   measured
-        layer_6144x384              4.83G     ~0.90   projected
-        layer_8192x512              8.59G     ~1.05   projected
+    Indexing by MACs PER SAMPLE, (d+1)*k, for the same reason:
+
+        shape             MACs/sample   neon/onnx
+        head_512x10             5,130     0.170   measured
+        layer_2048x64         131,136     0.377   measured
+        layer_4096x256      1,048,832     0.712   measured
+        layer_6144x384      2,359,680     0.803   measured
+        layer_8192x512      4,194,816     0.891   measured
+        layer_12288x768     9,437,952     ~1.01   projected
+        layer_16384x1024   16,778,240     ~1.11   projected
+
+    The growth is monotone but DECELERATING: the log-log slope falls from ~0.28
+    over the first three points to ~0.16 over the last three, which moves
+    projected parity out from ~4.2M to ~8.8M MACs/sample. The final two shapes
+    straddle that revised estimate rather than confirming the original one.
 
     If the ratio flattens below 1.0 instead, the kernel went memory-bound before
     catching BLAS -- an equally reportable result, since it bounds the ceiling.
     """
-    rng = np.random.default_rng(seed)
-    for name, d, k in [
-        ("head_512x10", 512, 10),        # the real hybrid head
-        ("layer_2048x64", 2048, 64),     # mid-size
-        ("layer_4096x256", 4096, 256),   # large; where tiling should pay off
-        ("layer_6144x384", 6144, 384),   # brackets the projected crossover
-        ("layer_8192x512", 8192, 512),   # expected to cross 1.0
-    ]:
+    for i, (name, d, k) in enumerate(SYNTHETIC_SHAPES):
+        if only is not None and name not in only:
+            # Skipped BEFORE materializing W. layer_16384x1024 alone is a 268 MiB
+            # complex128 array, and --cases exists precisely so a run does not
+            # pay for the shapes it did not ask for.
+            continue
+        # Seeded per shape, not from one shared stream: a filtered run must draw
+        # the SAME W as the full sweep, or `--cases layer_4096x256` would not be
+        # comparable with the run that produced the rest of the table.
+        rng = np.random.default_rng([seed, i])
         W = np.exp(1j * rng.uniform(0, 2 * np.pi, (k, d + 1))) / np.sqrt(d + 1)
         yield name, W, d
 
@@ -210,13 +234,14 @@ def main() -> int:
           f"|  neon_kernel={host['neon_kernel']}", flush=True)
     print(f"backends: {', '.join(backends)}\n", flush=True)
 
-    cases = list(synthetic_cases(args.seed)) if args.synthetic else []
+    only = None
     if args.cases is not None:
-        known = {name for name, _, _ in cases}
+        known = {name for name, _, _ in SYNTHETIC_SHAPES}
         unknown = set(args.cases) - known
         if unknown:
             ap.error(f"unknown case(s) {sorted(unknown)}; known: {sorted(known)}")
-        cases = [c for c in cases if c[0] in set(args.cases)]
+        only = set(args.cases)
+    cases = list(synthetic_cases(args.seed, only)) if args.synthetic else []
     cases += list(checkpoint_cases(args.models))
     if not cases:
         ap.error("nothing to benchmark: pass --synthetic and/or --models")

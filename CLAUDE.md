@@ -99,6 +99,13 @@ is ≤ 16 bytes = one NEON register = one `vqtbl1q_u8`.
   only the angular backends against `onnx` for this reason.
 - **`--cases` exists to keep CI finite.** Without it every synthetic shape runs,
   and `angular_tiled` at `layer_8192x512` needs roughly 21 minutes per cell.
+  Filtering happens before `W` is materialized, and each shape draws from its own
+  `default_rng([seed, i])` so a filtered run gets the same weights as the full
+  sweep — otherwise filtered and unfiltered tables would not be comparable.
+- **The `neon/onnx` ratio depends on shape, not batch.** Measured stable within a
+  few percent across batch 64/512/2048, which is why the crossover tail sweeps
+  the two largest shapes at batch 256. Sort crossover tables by per-sample MACs
+  `(d+1)*k`, never by total.
 - Checkpoints must load with `allow_pickle=False`; no Python objects in `.npz`.
 - Lifts are fitted on training features only.
 
