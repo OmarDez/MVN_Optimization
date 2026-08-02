@@ -102,7 +102,7 @@ class AngularHead:
 
     def __init__(self, W: np.ndarray, b: int = 4, backend: str = "complex128",
                  phase_only: bool = True, tile: tuple[int, int] = (64, 256),
-                 packed: bool = False):
+                 packed: bool = False, prune_tau: float = 0.0):
         if backend not in BACKENDS:
             raise ValueError(f"backend must be one of {BACKENDS}, got {backend!r}")
         self.W_fp = np.asarray(W, dtype=np.complex128)
@@ -113,8 +113,24 @@ class AngularHead:
         self.phase_only = bool(phase_only)
         self.tile = tile
 
+        # Magnitude pruning. Setting phase_only=True rescales every weight to
+        # |w| = 1, so a weight the training left at |w| = 0.0015 has its
+        # contribution multiplied by ~666x. Weights the model learned to ignore
+        # end up shouting as loudly as the ones that matter -- the loss is
+        # amplified noise, not discarded magnitude information.
+        #
+        # Dropping those below a threshold costs one MASK BIT per weight and
+        # keeps the datapath multiplier-free: a masked term is a select, not a
+        # product (`vbslq_s8` / `vandq_s8` on Arm, np.where here).
+        self.prune_tau = float(prune_tau)
+        self.keep = np.abs(self.W_fp) >= self.prune_tau if self.prune_tau > 0 \
+            else np.ones(self.W_fp.shape, dtype=bool)
+        self.sparsity = float(1.0 - self.keep.mean())
+
         # Quantized weights, in both representations.
         self.W_q = alg.quantize_unit(self.W_fp, self.b, self.phase_only)
+        if self.prune_tau > 0:
+            self.W_q = np.where(self.keep, self.W_q, 0)
         self.kW = np.ascontiguousarray(
             alg.phase_to_index(np.angle(self.W_fp), self.b), dtype=np.uint8
         )
@@ -250,7 +266,11 @@ class AngularHead:
 
         kSum = (kX[:, None, :] + kW[None, :, :]) & (self.L - 1)
         c, s = alg.cos_lut(self.b), alg.sin_lut(self.b)
-        return c[kSum].sum(axis=2) + 1j * s[kSum].sum(axis=2)
+        cv, sv = c[kSum], s[kSum]
+        if self.prune_tau > 0:
+            keep = self.keep[None, :, :]
+            cv, sv = np.where(keep, cv, 0.0), np.where(keep, sv, 0.0)
+        return cv.sum(axis=2) + 1j * sv.sum(axis=2)
 
     def _z_angular_tiled(self, kX: np.ndarray) -> np.ndarray:
         """
@@ -283,14 +303,29 @@ class AngularHead:
                 j1 = min(j0 + td, d1)
                 # (tn, k, td) index block, uint8 throughout.
                 blk = (kX[i0:i1, None, j0:j1] + kW[None, :, j0:j1]) & mask
-                acc_re[i0:i1] += c8[blk].sum(axis=2, dtype=np.int32)
-                acc_im[i0:i1] += s8[blk].sum(axis=2, dtype=np.int32)
+                cv, sv = c8[blk], s8[blk]
+                if self.prune_tau > 0:
+                    # A select, not a multiply: `vbslq_s8` keeps the datapath
+                    # multiplier-free at the cost of one mask bit per weight.
+                    keep = self.keep[None, :, j0:j1]
+                    cv, sv = np.where(keep, cv, np.int8(0)), np.where(keep, sv, np.int8(0))
+                acc_re[i0:i1] += cv.sum(axis=2, dtype=np.int32)
+                acc_im[i0:i1] += sv.sum(axis=2, dtype=np.int32)
 
         scale = 1.0 / alg.LUT_SCALE_I8
         return acc_re * scale + 1j * (acc_im * scale)
 
     def _z_neon(self, kX: np.ndarray) -> np.ndarray:
         """Hand-written C kernel using the AArch64 TBL instruction."""
+        if self.prune_tau > 0:
+            # Refuse rather than silently ignore the mask: the C kernel has no
+            # masked path yet, and returning unpruned logits from a head the
+            # caller asked to prune is the kind of divergence the parity gate
+            # exists to catch. One vandq_s8 against a 0x00/0xFF lane would do
+            # it; that is a kernel change with its own parity risk.
+            raise NotImplementedError(
+                "prune_tau is implemented in the NumPy backends only; use "
+                "backend='angular_tiled' to measure pruning")
         lib = _load_lib()
         if lib is None:
             raise RuntimeError(
@@ -384,17 +419,29 @@ class AngularHead:
             multiplier_free = False  # |w| != 1 reintroduces a real multiply
         n_w = self.W_fp.size
         weight_bytes = self.kW_packed.nbytes if self.packed else self.kW.nbytes
+        # Pruning buys a second compression axis on top of the phase bits, but
+        # it is not free: a dense mask costs one bit per weight, so b=4 goes
+        # from 4 to 5 bits and 16x becomes 12.8x. Above roughly 50% sparsity a
+        # sparse layout beats the dense mask; both are reported so the choice is
+        # visible rather than assumed.
+        mask_bytes = int(np.ceil(n_w / 8)) if self.prune_tau > 0 else 0
+        kept = int(self.keep.sum())
         return {
             "head_macs": macs,
+            "active_macs": kept,
+            "sparsity": self.sparsity,
+            "prune_tau": self.prune_tau,
             "real_mults_per_mac": 0 if multiplier_free else 4,
             "int_adds_per_mac": 1 if multiplier_free else 0,
             "lut_bytes": self.L,
             "multiplier_free": multiplier_free,
             "packed": self.packed,
+            "mask_bytes": mask_bytes,
+            "weight_bytes_sparse": int(np.ceil(kept * self.b / 8)),
             # Byte accounting for the compression claim. complex128 is the
             # unquantized form; fp32 real/imag is what actually ships today.
             "weight_bytes": int(weight_bytes),
             "weight_bytes_complex128": int(n_w * 16),
             "weight_bytes_fp32_reim": int(n_w * 8),
-            "compression_vs_fp32_reim": (n_w * 8) / max(weight_bytes, 1),
+            "compression_vs_fp32_reim": (n_w * 8) / max(weight_bytes + mask_bytes, 1),
         }

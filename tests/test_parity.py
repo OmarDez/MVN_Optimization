@@ -218,6 +218,73 @@ def test_four_bits_costs_almost_no_accuracy(trained):
     assert a4 >= a8 - 0.01, f"b=4 accuracy {a4:.4f} vs b=8 {a8:.4f}"
 
 
+def test_pruning_is_a_noop_at_tau_zero(fixture):
+    """The default path must be untouched. prune_tau=0 keeps every weight."""
+    W, X = fixture
+    ref = _head(W, 4, "angular_tiled").logits(X)
+    got = _head(W, 4, "angular_tiled", prune_tau=0.0).logits(X)
+    np.testing.assert_array_equal(got, ref)
+    assert _head(W, 4, "angular_tiled", prune_tau=0.0).sparsity == 0.0
+
+
+def test_pruning_zeroes_exactly_the_small_weights(fixture):
+    """
+    A pruned head must equal the same head with those weights removed from the
+    sum -- not merely be close to it. This is what makes the mask a select
+    rather than an approximation.
+    """
+    W, X = fixture
+    tau = float(np.median(np.abs(W)))
+    h = _head(W, 4, "angular_tiled", prune_tau=tau)
+    keep = np.abs(W) >= tau
+
+    # Reference built independently of the pruning code path: sum the LUT terms
+    # over kept positions only.
+    kX = h.to_indices(X).astype(np.int32)
+    kW = h.kW.astype(np.int32)
+    kSum = (kX[:, None, :] + kW[None, :, :]) & (h.L - 1)
+    c, s = np.cos(2 * np.pi * np.arange(h.L) / h.L), np.sin(2 * np.pi * np.arange(h.L) / h.L)
+    want = (np.where(keep[None], c[kSum], 0.0).sum(2)
+            + 1j * np.where(keep[None], s[kSum], 0.0).sum(2))
+    np.testing.assert_allclose(_head(W, 4, "angular_naive", prune_tau=tau).logits(X),
+                               want, atol=1e-9)
+    assert 0.0 < h.sparsity < 1.0
+
+
+def test_pruning_reports_its_cost_and_saving(fixture):
+    """Sparsity buys MACs but costs a mask bit per weight; both must be visible."""
+    W, X = fixture
+    tau = float(np.median(np.abs(W)))
+    rep = _head(W, 4, "angular_tiled", prune_tau=tau).mac_report()
+    assert rep["active_macs"] < rep["head_macs"]
+    assert rep["mask_bytes"] == int(np.ceil(W.size / 8))
+    # 4 bits + 1 mask bit = 5, so the 16x claim becomes 12.8x when pruning.
+    plain = _head(W, 4, "angular_tiled").mac_report()
+    assert rep["compression_vs_fp32_reim"] < plain["compression_vs_fp32_reim"]
+
+
+@pytest.mark.skipif(not neon_available(), reason="kernel not built for this host")
+def test_neon_refuses_to_silently_ignore_pruning(fixture):
+    """
+    The C kernel has no masked path. It must raise rather than return unpruned
+    logits from a head the caller asked to prune.
+    """
+    W, X = fixture
+    with pytest.raises(NotImplementedError):
+        _head(W, 4, "neon", prune_tau=0.5).logits(X)
+
+
+def test_pruning_recovers_part_of_the_modulus_cost(trained):
+    """
+    The finding, as a gate. On the trained checkpoint, discarding |w| costs
+    accuracy; pruning the smallest weights gives some of it back, which only
+    makes sense if that cost is amplified noise rather than lost information.
+    """
+    W, H, y = trained
+    acc = lambda **kw: float((_head(W, 4, "angular_tiled", **kw).predict(H) == y).mean())
+    assert acc(prune_tau=0.06) > acc(), "pruning should beat the unpruned head"
+
+
 def test_agreement_improves_with_bits(fixture):
     """
     Spending more phase bits must buy accuracy. Checked end to end rather than

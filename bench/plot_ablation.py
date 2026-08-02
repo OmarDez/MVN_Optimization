@@ -30,12 +30,64 @@ import matplotlib.pyplot as plt
 NEON_REGISTER_BYTES = 16
 
 
+def plot_prune(a) -> int:
+    """
+    Accuracy against sparsity, with the two reference lines that make it mean
+    something: phase-only (what pruning starts from) and full-polar (what the
+    modulus would have bought). The message is that part of the modulus cost is
+    recoverable by REMOVING weights, which only makes sense if that cost was
+    amplified noise to begin with.
+    """
+    rows = []
+    for p in a.json:
+        rows += json.loads(pathlib.Path(p).read_text())
+    rows.sort(key=lambda r: r["sparsity"])
+    sp = [r["sparsity"] * 100 for r in rows]
+    acc = [r["accuracy"] for r in rows]
+    po, fp = rows[0]["phase_only"], rows[0]["full_polar"]
+    best = max(rows, key=lambda r: r["accuracy"])
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.4))
+    ax.axhline(fp, color="#1f77b4", ls="--", lw=1.2,
+               label=f"full-polar, keeps |w|  ({fp:.4f})")
+    ax.axhline(po, color="#d62728", ls=":", lw=1.2,
+               label=f"phase-only, no pruning  ({po:.4f})")
+    ax.plot(sp, acc, "o-", color="#9467bd", label="phase-only + magnitude pruning")
+    ax.axvspan(0, 0, color="none")
+
+    ax.annotate(f"tau={best['tau']:.2f}: {best['sparsity'] * 100:.0f}% of weights "
+                f"removed,\n{best['gap_closed'] * 100:.0f}% of the modulus gap "
+                f"recovered",
+                xy=(best["sparsity"] * 100, best["accuracy"]),
+                xytext=(best["sparsity"] * 100 - 34, best["accuracy"] - 0.030),
+                fontsize=8, color="#9467bd",
+                arrowprops=dict(arrowstyle="->", color="#9467bd", lw=0.9))
+    ax.set_xlabel("weights removed (%)")
+    ax.set_ylabel(f"accuracy ({rows[0]['n_test']:,} test samples)")
+    ax.set_title("Magnitude pruning recovers part of the cost of discarding |w|\n"
+                 "phase_only rescales |w|=0.0015 to 1.0, so the smallest weights "
+                 "are amplified noise", fontsize=9)
+    ax.legend(fontsize=8, loc="lower left")
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+
+    out = pathlib.Path(a.out) / a.name
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=160)
+    print(f"wrote {out}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("json", nargs="+")
     ap.add_argument("--out", default="docs")
     ap.add_argument("--name", default="fig_bitwidth_ablation.png")
+    ap.add_argument("--kind", choices=["bits", "prune"], default="bits")
     a = ap.parse_args()
+
+    if a.kind == "prune":
+        return plot_prune(a)
 
     rows = []
     for p in a.json:

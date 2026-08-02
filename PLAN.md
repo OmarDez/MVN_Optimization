@@ -343,11 +343,46 @@ error-correction update does not preserve it.
 Hard-projecting back onto the unit circle after every update does make
 phase-only free — the gap closes to *exactly* 0.0000, as it must — but the
 model it produces is worse overall than the one whose modulus is then thrown
-away (0.8135 against 0.8571 at 3 epochs). So the projection is not the fix. A
-training rule that *learns* unit-modulus weights, by updating the phase directly
-instead of projecting after an additive step, is the open question. Until then,
-the multiplier-free claim is architecturally exact and carries a measured
-~2.8-point accuracy cost that should be quoted with it.
+away (0.8135 against 0.8571 at 3 epochs). So the projection is not the fix.
+
+### E3b — Magnitude pruning
+
+*Why.* The gap is not lost magnitude information, it is **amplified noise**.
+Setting `phase_only=True` rescales every weight to |w| = 1, so a weight training
+left at |w| = 0.0015 has its contribution multiplied by ~666× — the weights the
+model learned to ignore end up shouting as loudly as the ones that matter.
+
+*Method.* Threshold τ; weights with |w| < τ contribute nothing. That costs one
+**mask bit** per weight and stays multiplier-free, because a masked term is a
+select (`vbslq_s8` / `vandq_s8`), not a product.
+
+*Result* (b = 4, 10 000 MNIST test samples, `--prune-taus`):
+
+| τ | sparsity | accuracy | gap closed |
+|---|---|---|---|
+| 0.00 | 0.000 | 0.8920 | — |
+| 0.03 | 0.168 | 0.9016 | 33.9 % |
+| **0.06** | **0.449** | **0.9089** | **59.7 %** |
+| 0.07 | 0.541 | 0.9072 | 53.7 % |
+| 0.10 | 0.752 | 0.8376 | −192 % |
+
+Removing **45 % of the weights makes the model better**, recovering 60 % of the
+modulus gap. That is the prediction of the amplified-noise account and not of
+the lost-information one, so it is evidence for the diagnosis as well as a
+mitigation. It also gives a **second compression axis** orthogonal to phase
+bits — though not free: a dense mask is 1 bit per weight, so b = 4 becomes 5
+bits and 16× becomes 12.8×. Past ~50 % sparsity a sparse layout wins, and
+`mac_report()` reports both. `docs/fig_magnitude_pruning.png`.
+
+The C kernel has no masked path; `backend='neon'` raises rather than silently
+returning unpruned logits. One `vandq_s8` against a 0x00/0xFF lane would
+implement it.
+
+*Still open.* A training rule that *learns* unit-modulus weights, by updating
+the phase directly instead of projecting after an additive step, would remove
+the gap at its source rather than mitigating it. Until then the multiplier-free
+claim is architecturally exact and carries a measured cost that should be quoted
+with it: ~2.8 points, or ~1.1 after pruning.
 
 ### E4 — Tile-size sweep
 

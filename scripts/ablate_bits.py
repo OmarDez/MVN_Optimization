@@ -52,6 +52,10 @@ def main() -> int:
                          "torchvision -- which is how E3 gets measured on Arm.")
     ap.add_argument("--bits", type=int, nargs="+", default=[1, 2, 3, 4, 5, 6, 7, 8])
     ap.add_argument("--backend", default="angular_tiled")
+    ap.add_argument("--prune-taus", type=float, nargs="+", default=None,
+                    help="also sweep magnitude-pruning thresholds at --prune-b")
+    ap.add_argument("--prune-b", type=int, default=4)
+    ap.add_argument("--prune-out", default=None)
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
@@ -112,7 +116,56 @@ def main() -> int:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(rows, indent=2))
         print(f"\nwrote {p}")
+
+    if a.prune_taus:
+        prune_rows = sweep_pruning(ck, H, yte, a.prune_b, a.prune_taus, a.backend)
+        if a.prune_out:
+            p = pathlib.Path(a.prune_out)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(prune_rows, indent=2))
+            print(f"wrote {p}")
     return 0
+
+
+def sweep_pruning(ck, H, y, b, taus, backend) -> list[dict]:
+    """
+    Magnitude pruning: the second compression axis, and a partial answer to the
+    modulus cost.
+
+    Phase-only rescales every weight to |w| = 1, so a weight training left at
+    |w| = 0.0015 gets its contribution multiplied by ~666x. Zeroing the smallest
+    weights should therefore HELP, not merely cost less than it saves -- and it
+    does, which is evidence that the 2.8-point modulus gap is amplified noise
+    rather than lost magnitude information.
+    """
+    po = float((AngularHead(ck.W, b=b, backend=backend).predict(H) == y).mean())
+    fp = float((AngularHead(ck.W, b=b, backend="complex128",
+                            phase_only=False).predict(H) == y).mean())
+    gap = fp - po
+    print(f"\nmagnitude pruning at b={b} "
+          f"(phase-only {po:.4f}, full-polar {fp:.4f}, gap {gap:.4f})")
+    print(f"{'tau':>6}  {'sparsity':>8}  {'accuracy':>9}  {'gap closed':>10}  "
+          f"{'active MACs':>12}")
+
+    rows = []
+    for tau in [0.0] + list(taus):
+        h = AngularHead(ck.W, b=b, backend=backend, prune_tau=tau)
+        acc = float((h.predict(H) == y).mean())
+        rep = h.mac_report()
+        recovered = (acc - po) / gap if gap else 0.0
+        rows.append({"tau": tau, "sparsity": h.sparsity, "accuracy": acc,
+                     "gap_closed": recovered, "phase_only": po,
+                     "full_polar": fp, "b": b,
+                     "active_macs": rep["active_macs"],
+                     "head_macs": rep["head_macs"],
+                     "mask_bytes": rep["mask_bytes"],
+                     "weight_bytes": rep["weight_bytes"],
+                     "weight_bytes_sparse": rep["weight_bytes_sparse"],
+                     "compression_vs_fp32_reim": rep["compression_vs_fp32_reim"],
+                     "n_test": int(H.shape[0])})
+        print(f"{tau:>6.3f}  {h.sparsity:>8.3f}  {acc:>9.4f}  "
+              f"{recovered * 100:>9.1f}%  {rep['active_macs']:>12,}")
+    return rows
 
 
 if __name__ == "__main__":
