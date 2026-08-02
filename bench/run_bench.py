@@ -190,7 +190,7 @@ def synthetic_cases(seed: int = 0, only: set[str] | None = None):
         layer_8192x512      4,194,816     0.887
         layer_12288x768     9,437,952     0.961
         layer_16384x1024   16,778,240     1.016   <-- crossover
-        ffn_4096x11008     45,088,768             <-- Llama-7B FFN, 2.7x past it
+        ffn_4096x11008     45,088,768     1.198   <-- Llama-7B FFN width
 
     So the ratio DOES cross 1.0, at ~1.7e7 MACs per sample. The margin is small
     but not noise: 697.9 +- 1.35 ms for onnx against 687.1 +- 0.61 ms for neon
@@ -200,10 +200,12 @@ def synthetic_cases(seed: int = 0, only: set[str] | None = None):
     head, which invites the reading that parity only arrives at sizes nobody
     runs. Run the arithmetic instead: a Llama-7B FFN layer is 4096x11008 =
     45.1M MACs per sample, three of them per block. The crossover sits 2.7x
-    BELOW that. It is not in absurd territory -- it is beneath the regime where
-    transformer FFN compute already lives, and above small classifier heads.
-    That is the honest frame: the angular datapath loses on small heads and
-    reaches parity across the shape range where the FLOPs actually are.
+    BELOW that, so that shape is measured rather than extrapolated -- and it is
+    not marginal parity but 485.4 ms against 405.1 ms, a 1.20x win.
+
+    So the frame is not "parity at absurd sizes": the angular datapath loses on
+    small heads, reaches parity at ~1.7e7 MACs per sample, and is 20% ahead in
+    the shape regime where transformer FFN compute already lives.
 
     The claim is about the SHAPE REGION coinciding. It is not a claim that MVN
     works for LLMs -- nothing here trains or evaluates one, and that is future

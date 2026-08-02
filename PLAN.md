@@ -581,7 +581,7 @@ thread), which confirms the prediction and locates parity exactly:**
 | `layer_8192x512` | 4,194,816 | 0.887 | 32.0 MiB | 2.0 MiB |
 | `layer_12288x768` | 9,437,952 | 0.961 | 72.0 MiB | 4.5 MiB |
 | **`layer_16384x1024`** | **16,778,240** | **1.016** | **128.0 MiB** | **8.0 MiB** |
-| `ffn_4096x11008` | 45,088,768 | — | 344.0 MiB | 21.5 MiB |
+| **`ffn_4096x11008`** | **45,088,768** | **1.198** | **344.0 MiB** | **21.5 MiB** |
 
 The ratio does cross 1.0, and the margin is outside the noise (697.9 ± 1.35 ms
 for `onnx` against 687.1 ± 0.61 ms for `neon` over 30 repetitions, with `neon`'s
@@ -590,11 +590,14 @@ p95 still beating `onnx`'s fastest run).
 **Where that lands.** The crossover is ~3000× above this repository's own 512×10
 head, which invites the reading that parity only arrives at sizes nobody runs.
 Run the arithmetic instead. A Llama-7B FFN layer is 4096 × 11008 = **45.1M MACs
-per sample**, three per block. The crossover sits **2.7× below that**. It is not
-absurd territory — it is beneath the regime where transformer FFN compute
-already lives, and above small classifier heads. The honest frame is that the
-angular datapath loses on small heads and reaches parity across the shape range
-where the FLOPs actually are.
+per sample**, three per block. The crossover sits **2.7× below that** — so
+rather than extrapolate, that shape is measured too, and it is not marginal
+parity: **485.4 ms against 405.1 ms, a 1.20× win**, on weights that are 344.0
+MiB as deployed fp32 real/imag and 21.5 MiB packed.
+
+So the frame is not "parity at absurd sizes". The angular datapath loses on
+small heads, reaches parity at ~1.7e7 MACs per sample, and is ahead by 20 % in
+the shape regime where transformer FFN compute already lives.
 
 Note the scope: the claim is that the **shape region coincides**. It is not a
 claim that MVN works for LLMs — nothing here trains or evaluates one. That is

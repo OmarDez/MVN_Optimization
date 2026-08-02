@@ -148,7 +148,12 @@ jobs:
           python bench/plot_ablation.py results/e3-${{ matrix.runner }}.json \
             --out results --name fig_bitwidth_ablation-${{ matrix.runner }}.png
 
+      # always(): a later step failing must not throw away the measurements the
+      # earlier ones already produced. A missing fixture in the E3 step once
+      # discarded a completed 45-minute sweep, and the numbers had to be read
+      # back out of the raw log.
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: results-${{ matrix.runner }}
           path: results/
