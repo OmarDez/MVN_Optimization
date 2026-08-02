@@ -98,6 +98,23 @@ jobs:
             --bits 4 --batches 256 --repeat 30 \
             --out results/crossover-tail-${{ matrix.runner }}.json
 
+      # E3, on the architecture the claim is about. PLAN.md 5 asks for this to
+      # run on Arm rather than x86, and it now can: the activations are a
+      # committed slice, so no dataset and no torchvision are needed. Run with
+      # the neon backend on Arm so the accuracy column is the kernel's own, not
+      # a NumPy stand-in -- a kernel that changed the predictions would show up
+      # here even if the parity tests somehow passed.
+      - name: Bit-width ablation (E3)
+        run: |
+          BACKEND=angular_tiled
+          [ "$(uname -m)" = "aarch64" ] && BACKEND=neon
+          python scripts/ablate_bits.py \
+            --activations tests/data/mlmvn_mnist_activations.npz \
+            --backend "$BACKEND" \
+            --out results/e3-${{ matrix.runner }}.json
+          python bench/plot_ablation.py results/e3-${{ matrix.runner }}.json \
+            --out results --name fig_bitwidth_ablation-${{ matrix.runner }}.png
+
       - uses: actions/upload-artifact@v4
         with:
           name: results-${{ matrix.runner }}

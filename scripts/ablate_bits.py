@@ -25,7 +25,6 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from pymvn import AngularHead, encode_fft, load_checkpoint  # noqa: E402
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from train_zoo import load_dataset  # noqa: E402
 
 REFERENCE_BITS = 8  # "full precision" for agreement purposes
 
@@ -47,14 +46,24 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="models/mlmvn_fft_mnist.npz")
     ap.add_argument("--dataset", default="mnist")
+    ap.add_argument("--activations", default=None,
+                    help="precomputed activation slice (tests/data/*.npz). Skips "
+                         "the dataset entirely, so this runs on a CI box with no "
+                         "torchvision -- which is how E3 gets measured on Arm.")
     ap.add_argument("--bits", type=int, nargs="+", default=[1, 2, 3, 4, 5, 6, 7, 8])
     ap.add_argument("--backend", default="angular_tiled")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
     ck = load_checkpoint(a.model)
-    _, _, Xte, yte, shape = load_dataset(a.dataset)
-    H = hidden_activations(ck, Xte, shape)
+    if a.activations:
+        with np.load(a.activations, allow_pickle=False) as z:
+            H = np.exp(1j * z["phase"].astype(np.float64))
+            yte = z["y"].astype(int)
+    else:
+        from train_zoo import load_dataset
+        _, _, Xte, yte, shape = load_dataset(a.dataset)
+        H = hidden_activations(ck, Xte, shape)
 
     # The reference is the phase-only head at high b, so the sweep below isolates
     # phase resolution. It is NOT the number in the checkpoint: that was measured

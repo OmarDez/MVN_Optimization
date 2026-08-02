@@ -22,6 +22,8 @@ to match it essentially exactly. Any drift there is a kernel bug, not a
 quantization effect.
 """
 
+import pathlib
+
 import numpy as np
 import pytest
 
@@ -146,8 +148,8 @@ def test_prediction_agreement_vs_full_precision(fixture, b, min_agreement):
     rather than against the same-b complex head: the latter is not monotone in
     b on random weights, because both sides move at once.
 
-    Tighten these thresholds once real checkpoints land in models/
-    (see PLAN.md, Experiment E3).
+    These floors stay loose on purpose. The tightened version of this check now
+    exists separately, against a real checkpoint, below.
     """
     W, X = fixture
     p_ref = _head(W, REFERENCE_BITS, "complex128").predict(X)
@@ -156,6 +158,64 @@ def test_prediction_agreement_vs_full_precision(fixture, b, min_agreement):
     assert agreement >= min_agreement, (
         f"b={b}: agreement {agreement:.3f} < {min_agreement}"
     )
+
+
+CHECKPOINT = pathlib.Path(__file__).parent.parent / "models" / "mlmvn_fft_mnist.npz"
+ACTIVATIONS = pathlib.Path(__file__).parent / "data" / "mlmvn_mnist_activations.npz"
+
+
+@pytest.fixture(scope="module")
+def trained():
+    """
+    A real trained head and the activations it actually sees.
+
+    The activations are a committed 512-sample slice of the MNIST test set
+    pushed through the checkpoint's own hidden layer, stored as phases because
+    that is all the head reads. Committing them rather than recomputing keeps
+    this gate hermetic -- CI has no torchvision and no MNIST -- and the slice is
+    370 KiB.
+    """
+    if not (CHECKPOINT.exists() and ACTIVATIONS.exists()):
+        pytest.skip("trained checkpoint or its activations not available")
+    from pymvn import load_checkpoint
+    ck = load_checkpoint(CHECKPOINT)
+    with np.load(ACTIVATIONS, allow_pickle=False) as z:
+        H = np.exp(1j * z["phase"].astype(np.float64))
+        y = z["y"].astype(int)
+    return ck.W, H, y
+
+
+@pytest.mark.parametrize("b,min_agreement", [(2, 0.88), (3, 0.95), (4, 0.97), (5, 0.98)])
+def test_trained_head_agreement_is_much_tighter(trained, b, min_agreement):
+    """
+    The same question as above, asked of a model that was actually trained.
+
+    Random weights leave the class logits nearly tied, so half a sector of phase
+    error flips the argmax and b=3 scrapes 0.65. A trained model concentrates
+    the decision margin and reaches 0.9668 at the same b. That difference is the
+    reason the loose floors above cannot be tightened in place -- they are
+    measuring the worst case, and it is a genuinely different quantity.
+
+    Measured 0.9023 / 0.9668 / 0.9805 / 0.9883; floors sit a little below.
+    """
+    W, H, _ = trained
+    p_ref = _head(W, REFERENCE_BITS, "complex128").predict(H)
+    p_ang = _head(W, b, "angular_tiled").predict(H)
+    agreement = float((p_ref == p_ang).mean())
+    assert agreement >= min_agreement, (
+        f"b={b}: agreement {agreement:.4f} < {min_agreement}")
+
+
+def test_four_bits_costs_almost_no_accuracy(trained):
+    """
+    The E3 claim as a merge gate: b=4 must stay within one point of b=8 on real
+    data. If a change to quantization or the LUT breaks this, the 16-byte
+    coincidence in PLAN.md 2.4 no longer holds and the argument collapses.
+    """
+    W, H, y = trained
+    acc = lambda b: float((_head(W, b, "angular_tiled").predict(H) == y).mean())
+    a4, a8 = acc(4), acc(REFERENCE_BITS)
+    assert a4 >= a8 - 0.01, f"b=4 accuracy {a4:.4f} vs b=8 {a8:.4f}"
 
 
 def test_agreement_improves_with_bits(fixture):
