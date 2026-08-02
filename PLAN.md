@@ -221,25 +221,30 @@ Entries 2–3 are the accuracy story. Stretch goals get cut without ceremony.
 
 *Measured* (`scripts/train_zoo.py`, 5 epochs, frozen into `models/`):
 
-| Checkpoint | Accuracy | Note |
-|---|---|---|
-| `mlmvn_fft_mnist` | **0.9201** | full-polar; 0.8925 phase-only — see E3 |
-| `resnet18_mnist` | 0.8917 | not the 97.1 % above |
-| `mobilenetv3_cifar10` | 0.2324 | barely above the 0.10 floor |
+| Checkpoint | Accuracy | Was | Setting |
+|---|---|---|---|
+| `mlmvn_fft_mnist` | **0.9201** | — | trained end to end; 0.8939 phase-only, see E3 |
+| `resnet18_mnist` | **0.9514** | 0.8917 | frozen ImageNet features + MVN head |
+| `mobilenetv3_cifar10` | **0.7420** | 0.2324 | frozen ImageNet features + MVN head |
 
-Entry 1 delivers. **Entries 2–3 do not, and the cause is one line rather than
-three:** `backbone_features` builds each backbone with `weights=None`, puts it
-in `eval()`, and never trains it or loads pretrained weights. Those are random
-convolutional projections, and only the MVN head learns. CIFAR-10 is hit twice,
-because `load_dataset` also averages the RGB channels to grey before handing
-them to a network expecting three.
+The "was" column is what the same script produced before three fixes, and the
+gap is worth recording because none of it was a modelling problem:
 
-That makes them a lower bound on the head rather than the accuracy story they
-were meant to be — whatever the head reaches here, it reaches unaided. The
-angular claims are unaffected: C1, C2 and C4 are about the head, and E3 is run
-on entry 1, which is trained end to end. But entries 2–3 should not be quoted as
-accuracy results until the backbones are either pretrained or actually trained,
-and the 97.1 % in the table above has never been reproduced in this repository.
+1. `backbone_features` built every backbone with `weights=None` and never
+   trained it. Those were random convolutional projections; only the head
+   learned. Now `weights="DEFAULT"`, frozen — ordinary transfer learning.
+2. `load_dataset` averaged CIFAR-10's RGB channels to grey before handing them
+   to a three-channel network. Colour now survives; greyscale is *repeated*
+   across channels rather than fed as one.
+3. Nothing was normalized with the ImageNet statistics the weights were trained
+   under, which is the easiest thing to leave out and one of the most expensive.
+
+These are **frozen pretrained features with a trained angular head**, stated
+plainly because the number means nothing otherwise. What the zoo demonstrates is
+that `AngularHead` is agnostic to the backbone — the quality of the backbone is
+not what is under test. The 97.1 % quoted in the table above is from the
+literature and has still not been reproduced here; 0.9514 at 112×112 without
+fine-tuning is the number this repository stands behind.
 
 ---
 
