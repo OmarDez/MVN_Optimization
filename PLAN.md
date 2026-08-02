@@ -378,11 +378,50 @@ The C kernel has no masked path; `backend='neon'` raises rather than silently
 returning unpruned logits. One `vandq_s8` against a 0x00/0xFF lane would
 implement it.
 
-*Still open.* A training rule that *learns* unit-modulus weights, by updating
-the phase directly instead of projecting after an additive step, would remove
-the gap at its source rather than mitigating it. Until then the multiplier-free
-claim is architecturally exact and carries a measured cost that should be quoted
-with it: ~2.8 points, or ~1.1 after pruning.
+### E3c — Riemannian training on the torus (negative result)
+
+§2.5 says the state space is T^d. The obvious conjecture was that the modulus
+gap is an artifact of *extrinsic* optimization: the correction rule updates in
+the ambient ℂ^d, and projecting back onto the circle afterwards destroys, every
+step, the magnitude the rule uses as an implicit learning rate. Optimizing
+*intrinsically* — projecting the update onto the tangent space `i·w·ℝ` and
+integrating the phase, so the weights never leave the manifold — should then be
+strictly better. `geometry="tangent"` implements it:
+
+$$\Delta\phi = \tfrac{C}{n+1}\,\mathrm{Im}\!\left(\varepsilon\,\overline{x}\,\overline{w}\right)$$
+
+*Result* (MLMVN, MNIST, 5 epochs, identical seeds). **The conjecture is wrong.**
+
+| geometry | MLMVN | phase-only | modulus cost | \|W\| |
+|---|---|---|---|---|
+| ambient (default) | 0.9201 | 0.8939 | +0.0264 | [0.0015, 2.0771] |
+| extrinsic projection | 0.8276 | 0.8204 | 0.0000 | [1, 1] |
+| **tangent (T^d)** | 0.8271 | **0.8224** | **0.0000** | [1, 1] |
+
+The tangent rule does exactly what the geometry promises — the modulus never
+moves, so `phase_only` is free *by construction* rather than by luck. It simply
+does not help: 0.8224 against extrinsic projection's 0.8204, a difference of
+ten test samples. Extrinsic versus intrinsic was not the problem.
+
+What the two constrained rows share is the real cause: **|w| is not overhead,
+it is capacity.** In the ambient rule the modulus accumulates evidence and acts
+as a per-weight adaptive step size. Pinning it to 1 removes one real degree of
+freedom per weight, and that costs about 7 points — far more than the 2.6 the
+modulus is worth at inference.
+
+So the ranking of genuinely multiplier-free options is settled, and the winner
+is not the elegant one:
+
+| | multiplier-free accuracy |
+|---|---|
+| ambient + phase-only + pruning (τ = 0.06) | **0.9089** |
+| ambient + phase-only | 0.8939 |
+| tangent (T^d) | 0.8224 |
+| extrinsic projection | 0.8204 |
+
+**Train unconstrained, discard the modulus at inference, prune what that
+amplifies.** The manifold is the right description of the state space and the
+wrong constraint to impose during training.
 
 ### E4 — Tile-size sweep
 

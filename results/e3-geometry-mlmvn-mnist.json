@@ -1,0 +1,29 @@
+[
+  {
+    "name": "ambient",
+    "mlmvn": 0.9201,
+    "full_polar": 0.9203,
+    "phase_only": 0.8939,
+    "modulus_cost": 0.02639999999999998,
+    "mod_min": 0.0014684139167424743,
+    "mod_max": 2.0770708754588947
+  },
+  {
+    "name": "extrinsic proj",
+    "mlmvn": 0.8276,
+    "full_polar": 0.8204,
+    "phase_only": 0.8204,
+    "modulus_cost": 0.0,
+    "mod_min": 0.9999999999999997,
+    "mod_max": 1.0000000000000004
+  },
+  {
+    "name": "tangent (T^d)",
+    "mlmvn": 0.8271,
+    "full_polar": 0.8224,
+    "phase_only": 0.8224,
+    "modulus_cost": 0.0,
+    "mod_min": 0.9999999999999998,
+    "mod_max": 1.0000000000000002
+  }
+]

@@ -48,10 +48,20 @@ class MVNHead:
     """Single one-vs-all MVN layer trained by error correction."""
 
     def __init__(self, n_inputs: int, n_classes: int = 10, lr: float = 1.0,
-                 seed: int = 7):
+                 seed: int = 7, geometry: str = "ambient"):
+        if geometry not in ("ambient", "tangent"):
+            raise ValueError(f"geometry must be 'ambient' or 'tangent', "
+                             f"got {geometry!r}")
         rng = np.random.default_rng(seed)
         phases = rng.uniform(0.0, 2.0 * np.pi, (n_classes, n_inputs + 1))
-        self.W = np.exp(1j * phases) / np.sqrt(n_inputs + 1)
+        self.geometry = geometry
+        if geometry == "tangent":
+            # State IS the phase. There is no modulus to drift, so nothing has
+            # to be projected back afterwards.
+            self.phi = phases
+            self.W = np.exp(1j * phases)
+        else:
+            self.W = np.exp(1j * phases) / np.sqrt(n_inputs + 1)
         self.n_classes = n_classes
         self.lr = lr
 
@@ -85,7 +95,25 @@ class MVNHead:
                 eps = T[i] - O[0]
                 if np.max(np.abs(eps)) < tol:
                     continue
-                self.W += scale * eps[:, None] * np.conj(Xb[0])[None, :]
+                if self.geometry == "tangent":
+                    # Riemannian SGD on the torus T^d, which PLAN.md 2.5 already
+                    # names as the state space. The ambient rule updates in C^d
+                    # and leaves the manifold; projecting back afterwards is
+                    # EXTRINSIC and destroys, every step, the magnitude the
+                    # correction rule uses as an implicit learning rate.
+                    #
+                    # The tangent space at w = e^{i.phi} is i.w.R, so the
+                    # component of the ambient step along it is
+                    #     a = Im(dW . conj(w)),   dW = scale . eps . conj(x)
+                    # and moving along the tangent by `a` is, to first order,
+                    # rotating phi by `a`. The weight never leaves S^1, so there
+                    # is no modulus to destroy.
+                    dphi = scale * np.imag(
+                        eps[:, None] * np.conj(Xb[0])[None, :] * np.conj(self.W))
+                    self.phi += dphi
+                    self.W = np.exp(1j * self.phi)
+                else:
+                    self.W += scale * eps[:, None] * np.conj(Xb[0])[None, :]
             if verbose:
                 print(f"  epoch {ep + 1}: train acc {self.accuracy(X, y):.4f}")
         return self
@@ -101,12 +129,20 @@ class MLMVN:
 
     def __init__(self, n_inputs: int, n_hidden: int, n_classes: int,
                  lr: float = 1.0, beta: float = 0.5, dead_zone: float = 0.0,
-                 seed: int = 7):
+                 seed: int = 7, geometry: str = "ambient"):
+        if geometry not in ("ambient", "tangent"):
+            raise ValueError(f"geometry must be 'ambient' or 'tangent', "
+                             f"got {geometry!r}")
+        self.geometry = geometry
         rng = np.random.default_rng(seed)
         self.W1 = np.exp(1j * rng.uniform(0, 2 * np.pi, (n_hidden, n_inputs + 1)))
         self.W1 /= np.sqrt(n_inputs + 1)
         self.W2 = np.exp(1j * rng.uniform(0, 2 * np.pi, (n_classes, n_hidden + 1)))
         self.W2 /= np.sqrt(n_hidden + 1)
+        if geometry == "tangent":
+            # Unit modulus from the start, and phase is the state that moves.
+            self.W1, self.W2 = self.W1 / np.abs(self.W1), self.W2 / np.abs(self.W2)
+            self.phi1, self.phi2 = np.angle(self.W1), np.angle(self.W2)
 
         self.n_inputs, self.n_hidden, self.n_classes = n_inputs, n_hidden, n_classes
         self.lr, self.beta, self.dead_zone = lr, beta, dead_zone
@@ -179,10 +215,23 @@ class MLMVN:
             return correct, err_sq
 
         mask = np.abs(eps) > 0
-        self.W2[mask] += (lr / (self.n_hidden + 1)) * eps[mask][:, None] * np.conj(Hb)[None, :]
-
         eps_h = (self._pinv @ eps) / Zh_mag
         act = np.abs(eps_h) > 1e-10
+
+        if self.geometry == "tangent":
+            # Riemannian SGD on T^d: project the ambient step onto the tangent
+            # i.w.R and integrate the phase directly, so the weights never leave
+            # the manifold. See MVNHead.fit for the derivation.
+            self.phi2[mask] += (lr / (self.n_hidden + 1)) * np.imag(
+                eps[mask][:, None] * np.conj(Hb)[None, :] * np.conj(self.W2[mask]))
+            self.W2[mask] = np.exp(1j * self.phi2[mask])
+            if np.any(act):
+                self.phi1[act] += (lr / (self.n_inputs + 1)) * np.imag(
+                    eps_h[act][:, None] * np.conj(Xb)[None, :] * np.conj(self.W1[act]))
+                self.W1[act] = np.exp(1j * self.phi1[act])
+            return correct, err_sq
+
+        self.W2[mask] += (lr / (self.n_hidden + 1)) * eps[mask][:, None] * np.conj(Hb)[None, :]
         if np.any(act):
             self.W1[act] += (lr / (self.n_inputs + 1)) * eps_h[act][:, None] * np.conj(Xb)[None, :]
 

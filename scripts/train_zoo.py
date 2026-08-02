@@ -28,8 +28,16 @@ from pymvn import (MLMVN, MVNHead, encode_fft, fit_lift, lift,  # noqa: E402
 ZOO = ["mlmvn_fft", "resnet18", "mobilenetv3", "vit_tiny"]
 
 
-def load_dataset(name: str):
-    """MNIST/CIFAR-10 via torchvision; falls back to sklearn digits offline."""
+def load_dataset(name: str, color: bool = False):
+    """
+    MNIST/CIFAR-10 via torchvision; falls back to sklearn digits offline.
+
+    `color` decides how CIFAR-10 comes back, and it matters. The FFT encoder
+    consumes a 2-D image, so the pure MLMVN path needs greyscale. A backbone
+    does not: averaging the channels first throws away two thirds of the input
+    before a network that expects three. Shapes are returned as (C, H, W) so the
+    caller never has to guess which convention it got.
+    """
     if name in ("mnist", "cifar10"):
         try:
             import torchvision
@@ -39,11 +47,17 @@ def load_dataset(name: str):
                 te = torchvision.datasets.MNIST(root, train=False, download=True)
                 Xtr = tr.data.numpy().reshape(len(tr), -1)
                 Xte = te.data.numpy().reshape(len(te), -1)
-                return Xtr, tr.targets.numpy(), Xte, te.targets.numpy(), (28, 28)
+                return Xtr, tr.targets.numpy(), Xte, te.targets.numpy(), (1, 28, 28)
             tr = torchvision.datasets.CIFAR10(root, train=True, download=True)
             te = torchvision.datasets.CIFAR10(root, train=False, download=True)
+            if color:
+                # (N, H, W, 3) -> (N, 3, H, W), flattened.
+                f = lambda d: np.asarray(d.data).transpose(0, 3, 1, 2).reshape(len(d.data), -1)
+                return (f(tr), np.asarray(tr.targets), f(te),
+                        np.asarray(te.targets), (3, 32, 32))
             g = lambda d: np.asarray(d.data).mean(axis=3).reshape(len(d.data), -1)
-            return (g(tr), np.asarray(tr.targets), g(te), np.asarray(te.targets), (32, 32))
+            return (g(tr), np.asarray(tr.targets), g(te),
+                    np.asarray(te.targets), (1, 32, 32))
         except Exception as e:
             print(f"[warn] torchvision unavailable ({e}); using sklearn digits")
 
@@ -53,55 +67,75 @@ def load_dataset(name: str):
     X = np.repeat(np.repeat(d.images, 4, axis=1), 4, axis=2)[:, :28, :28]
     X = (X / X.max() * 255).reshape(len(d.images), -1).astype(np.uint8)
     Xtr, Xte, ytr, yte = train_test_split(X, d.target, test_size=0.2, random_state=0)
-    return Xtr, ytr, Xte, yte, (28, 28)
+    return Xtr, ytr, Xte, yte, (1, 28, 28)
 
 
-def backbone_features(model: str, Xtr, Xte, shape, seed: int = 0):
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+def backbone_features(model: str, Xtr, Xte, shape, seed: int = 0,
+                      pretrained: bool = True, size: int = 112):
     """
-    Return real-valued features from a torch backbone.
+    Return real-valued features from a FROZEN PRETRAINED torch backbone.
 
-    The backbone is constructed with weights=None and never trained: these are
-    RANDOM convolutional projections, and the MVN head is the only thing that
-    learns. That is a deliberate lower bound on the head -- whatever accuracy it
-    reaches here, it reaches without help from the feature extractor -- but it
-    is not the setting PLAN.md 3.2 quotes, so do not compare the two numbers.
+    This is ordinary transfer learning: ImageNet features, no fine-tuning, and
+    the MVN head is the only thing that learns. That is the honest setting for
+    what the zoo is meant to demonstrate -- that `AngularHead` is agnostic to
+    the backbone -- since the quality of the backbone is not what is under test.
 
-    Seeded because of it. An unseeded random backbone makes the checkpoint
-    irreproducible: the head weights would refer to features nobody can
-    regenerate. The seed goes into the checkpoint metadata.
+    `pretrained=False` keeps the old behaviour (random projections) as a lower
+    bound on the head. It is seeded so the checkpoint stays reproducible; with
+    pretrained weights the seed is irrelevant but still recorded.
+
+    Two details that are easy to get wrong and expensive to miss:
+      * Greyscale input is REPEATED across three channels, never fed to a
+        3-channel stem as one. Colour input keeps its channels.
+      * Inputs are resized and normalized with the ImageNet statistics the
+        weights were trained under. Skipping this quietly costs a lot of
+        accuracy, and it is the single easiest thing to leave out.
+
+    `size=112` rather than the canonical 224: measured on this box, 224 costs
+    ~31 minutes to extract 70k features against ~14 at 112, and the features
+    only feed a linear-ish head. Raise it if the accuracy matters more than the
+    wall clock.
     """
     import torch, torch.nn as nn
+    import torch.nn.functional as F
     from torchvision import models
 
     torch.manual_seed(seed)
 
-    H, W = shape
-    to_t = lambda X: torch.tensor(X, dtype=torch.float32).reshape(-1, 1, H, W) / 255.0
-    Itr, Ite = to_t(Xtr), to_t(Xte)
-    if model in ("mobilenetv3", "vit_tiny"):
-        Itr, Ite = Itr.repeat(1, 3, 1, 1), Ite.repeat(1, 3, 1, 1)
+    C, H, W = shape
+    mean = torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
+    std = torch.tensor(IMAGENET_STD).view(1, 3, 1, 1)
+
+    def to_t(X):
+        I = torch.tensor(np.asarray(X), dtype=torch.float32).reshape(-1, C, H, W) / 255.0
+        if C == 1:
+            I = I.repeat(1, 3, 1, 1)          # grey -> 3 channels, not averaged
+        I = F.interpolate(I, size=(size, size), mode="bilinear", align_corners=False)
+        return (I - mean) / std
 
     if model == "resnet18":
-        net = models.resnet18(weights=None, num_classes=10)
-        net.conv1 = nn.Conv2d(1, 64, 3, 1, 1, bias=False)
-        net.maxpool = nn.Identity()
+        net = models.resnet18(weights="DEFAULT" if pretrained else None)
         feat = nn.Sequential(*list(net.children())[:-1])
     elif model == "mobilenetv3":
-        net = models.mobilenet_v3_small(weights=None, num_classes=10)
+        net = models.mobilenet_v3_small(weights="DEFAULT" if pretrained else None)
         feat = nn.Sequential(net.features, nn.AdaptiveAvgPool2d(1))
     elif model == "vit_tiny":
-        import torch.nn.functional as F
-        net = models.vit_b_16(weights=None, num_classes=10)
-        feat = None  # placeholder: see PLAN.md, stretch goal S1
         raise NotImplementedError("vit_tiny is a stretch goal; see PLAN.md")
     else:
         raise ValueError(model)
 
     feat.eval()
     with torch.no_grad():
-        f = lambda I: torch.cat([feat(I[i:i + 256]).flatten(1)
-                                 for i in range(0, len(I), 256)]).numpy()
-        return f(Itr), f(Ite)
+        def f(X):
+            out = []
+            for i in range(0, len(X), 128):
+                out.append(feat(to_t(X[i:i + 128])).flatten(1).numpy())
+            return np.concatenate(out)
+        return f(Xtr), f(Xte)
 
 
 def main() -> int:
@@ -115,22 +149,28 @@ def main() -> int:
     ap.add_argument("--freq-size", type=int, default=12)
     ap.add_argument("--seed", type=int, default=0,
                     help="backbone init seed; recorded in the checkpoint")
+    ap.add_argument("--no-pretrained", action="store_true",
+                    help="random backbone instead of ImageNet weights: a lower "
+                         "bound on the head rather than a usable model")
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--outdir", default="models")
     a = ap.parse_args()
 
     targets = ZOO[:3] if a.all else [a.model]
-    Xtr, ytr, Xte, yte, shape = load_dataset(a.dataset)
-    print(f"dataset={a.dataset}  train={Xtr.shape}  test={Xte.shape}")
+    pretrained = not a.no_pretrained
 
     for model in targets:
         t0 = time.time()
         print(f"\n=== {model} ===")
+        # Colour only for the backbones: the FFT encoder takes a 2-D image.
+        Xtr, ytr, Xte, yte, shape = load_dataset(a.dataset,
+                                                 color=(model != "mlmvn_fft"))
+        print(f"dataset={a.dataset}  train={Xtr.shape}  shape={shape}")
 
         if model == "mlmvn_fft":
             # Fully phase-native: every inference MAC can be multiplier-free.
-            Ctr = encode_fft(Xtr, a.freq_size, shape)
-            Cte = encode_fft(Xte, a.freq_size, shape)
+            Ctr = encode_fft(Xtr, a.freq_size, shape[1:])
+            Cte = encode_fft(Xte, a.freq_size, shape[1:])
             net = MLMVN(Ctr.shape[1], a.hidden, 10)
             net.fit(Ctr, ytr, epochs=a.epochs)
             acc = net.accuracy(Cte, yte)
@@ -142,7 +182,8 @@ def main() -> int:
                      "encoding": "fft_phase_only", "fully_phase_native": True}
         else:
             W_hidden = None
-            Ztr, Zte = backbone_features(model, Xtr, Xte, shape, seed=a.seed)
+            Ztr, Zte = backbone_features(model, Xtr, Xte, shape, seed=a.seed,
+                                         pretrained=pretrained)
             lp = fit_lift(Ztr, a.lift)
             Ctr, Cte = lift(Ztr, lp), lift(Zte, lp)
             head = MVNHead(Ctr.shape[1], 10).fit(Ctr, ytr, epochs=a.epochs)
@@ -154,7 +195,8 @@ def main() -> int:
             # as well as fatal.
             extra = {"feature_dim": int(Ztr.shape[1]),
                      "backbone_seed": int(a.seed),
-                     "backbone_trained": False,
+                     "backbone_pretrained": bool(pretrained),
+                     "backbone_finetuned": False,
                      "fully_phase_native": False}
 
         out = pathlib.Path(a.outdir) / f"{model}_{a.dataset}.npz"
