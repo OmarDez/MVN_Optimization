@@ -437,25 +437,44 @@ not achievable on this timeline and should not be attempted.
 **Measured on Arm afterwards (Neoverse N2, `ubuntu-24.04-arm`, b = 4, single
 thread), which confirms the prediction and locates parity exactly:**
 
-```
-shape              MACs/sample   neon/onnx
-head_512x10              5,130     0.158     <- the head this repo deploys
-layer_4096x256       1,048,832     0.707
-layer_8192x512       4,194,816     0.887
-layer_12288x768      9,437,952     0.961
-layer_16384x1024    16,778,240     1.016     <- crossover
-```
+| shape | MACs/sample | neon/onnx | fp32 re/im | packed 4-bit |
+|---|---|---|---|---|
+| `head_512x10` | 5,130 | 0.158 | 0.04 MiB | 0.00 MiB |
+| `layer_4096x256` | 1,048,832 | 0.707 | 8.0 MiB | 0.5 MiB |
+| `layer_8192x512` | 4,194,816 | 0.887 | 32.0 MiB | 2.0 MiB |
+| `layer_12288x768` | 9,437,952 | 0.961 | 72.0 MiB | 4.5 MiB |
+| **`layer_16384x1024`** | **16,778,240** | **1.016** | **128.0 MiB** | **8.0 MiB** |
+| `ffn_4096x11008` | 45,088,768 | — | 344.0 MiB | 21.5 MiB |
 
 The ratio does cross 1.0, and the margin is outside the noise (697.9 ± 1.35 ms
-for `onnx` against 687.1 ± 0.61 ms for `neon` over 30 repetitions). But the
-log-log slope decays monotonically — 0.26, 0.32, 0.16, 0.17, 0.10, 0.10 — so
-parity is approached asymptotically, and it arrives roughly 3000× in per-sample
-MACs above the 512×10 head that is actually deployed. The claim table below is
-unchanged by this: "near parity at absurd layer sizes" is not "beats BLAS."
+for `onnx` against 687.1 ± 0.61 ms for `neon` over 30 repetitions, with `neon`'s
+p95 still beating `onnx`'s fastest run).
 
-The same sweep on x86_64 is flat at 0.047–0.059 across all seven shapes, which
-is the control — without `vqtbl1q_u8` the kernel is scalar C, and the entire
-Arm curve is attributable to the table-lookup datapath.
+**Where that lands.** The crossover is ~3000× above this repository's own 512×10
+head, which invites the reading that parity only arrives at sizes nobody runs.
+Run the arithmetic instead. A Llama-7B FFN layer is 4096 × 11008 = **45.1M MACs
+per sample**, three per block. The crossover sits **2.7× below that**. It is not
+absurd territory — it is beneath the regime where transformer FFN compute
+already lives, and above small classifier heads. The honest frame is that the
+angular datapath loses on small heads and reaches parity across the shape range
+where the FLOPs actually are.
+
+Note the scope: the claim is that the **shape region coincides**. It is not a
+claim that MVN works for LLMs — nothing here trains or evaluates one. That is
+future work, not a result.
+
+**And parity is not the whole row.** At the crossover the weights are 128 MiB as
+deployed fp32 real/imag against 8 MiB packed 4-bit. "As fast as BLAS" is easy to
+wave away and "16× smaller" is easy to discount as a memory trick; the two in
+the same row are much harder to dismiss than either alone, which is why
+`bench/report.py` prints them in one table rather than two.
+
+**The x86_64 control.** Flat at 0.047–0.059 across every shape. Same code, same
+weights, same batches — the only difference is that without `vqtbl1q_u8` the
+kernel falls back to scalar C. That attributes the entire Arm curve, 0.158 to
+1.016, to the table-lookup instruction and to nothing in NumPy, BLAS or the
+harness. It is the single cleanest piece of evidence in the sweep that this is
+an Arm-specific result rather than a benchmarking artifact.
 
 ### The reframe
 

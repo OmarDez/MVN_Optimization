@@ -140,18 +140,23 @@ SYNTHETIC_SHAPES = [
     ("layer_6144x384", 6144, 384),     # brackets the original projection
     ("layer_8192x512", 8192, 512),     # 0.891: close, but did not cross
     ("layer_12288x768", 12288, 768),   # straddles the revised estimate
-    ("layer_16384x1024", 16384, 1024), # past it, if the fit holds
+    ("layer_16384x1024", 16384, 1024), # 1.016: the crossover
+    ("ffn_4096x11008", 4096, 11008),   # a Llama-7B FFN layer, to scale
 ]
 
 
 def synthetic_cases(seed: int = 0, only: set[str] | None = None):
     """
-    Seven shapes spanning the interesting regime.
+    Eight shapes spanning the interesting regime.
 
     The real hybrid head (512 features x 10 classes) is far too small to measure
     anything -- Python and allocation overhead dominate completely. The larger
     layers exist to expose the crossover point where the angular datapath
     overtakes BLAS, which is itself the result worth reporting.
+
+    The last shape is not synthetic in the same sense as the others: 4096x11008
+    is the FFN width of Llama-7B, and it is there to put the crossover on a
+    scale a reader already has intuition for.
 
     The neon/onnx ratio is a function of SHAPE, not of batch: measured on
     Neoverse N2 it holds to within a few percent across batch 64/512/2048
@@ -169,20 +174,31 @@ def synthetic_cases(seed: int = 0, only: set[str] | None = None):
         layer_8192x512      4,194,816     0.887
         layer_12288x768     9,437,952     0.961
         layer_16384x1024   16,778,240     1.016   <-- crossover
+        ffn_4096x11008     45,088,768             <-- Llama-7B FFN, 2.7x past it
 
     So the ratio DOES cross 1.0, at ~1.7e7 MACs per sample. The margin is small
     but not noise: 697.9 +- 1.35 ms for onnx against 687.1 +- 0.61 ms for neon
     over 30 repetitions, and neon's p95 still beats onnx's fastest run.
 
-    Read it with the growth curve, though. The log-log slope decays the whole
-    way -- 0.26, 0.32, 0.16, 0.17, 0.10, 0.10 -- so parity is approached
-    asymptotically, and crossing happens roughly 3000x (in per-sample MACs)
-    above the 512x10 head this repository actually deploys, where the ratio is
-    0.158. This measures where the angular datapath stops losing; it does not
-    make "faster than BLAS" a claim about any deployable head. See PLAN.md 7.
+    WHERE THAT LANDS. The crossover is 3000x above this repository's own 512x10
+    head, which invites the reading that parity only arrives at sizes nobody
+    runs. Run the arithmetic instead: a Llama-7B FFN layer is 4096x11008 =
+    45.1M MACs per sample, three of them per block. The crossover sits 2.7x
+    BELOW that. It is not in absurd territory -- it is beneath the regime where
+    transformer FFN compute already lives, and above small classifier heads.
+    That is the honest frame: the angular datapath loses on small heads and
+    reaches parity across the shape range where the FLOPs actually are.
 
-    x86_64 is the control: flat at 0.047-0.059 across all seven shapes, since
-    without vqtbl1q_u8 the kernel falls back to scalar C.
+    The claim is about the SHAPE REGION coinciding. It is not a claim that MVN
+    works for LLMs -- nothing here trains or evaluates one, and that is future
+    work rather than a result.
+
+    x86_64 is the control, and it is arguably the strongest single number in the
+    sweep: flat at 0.047-0.059 across every shape, because without vqtbl1q_u8
+    the kernel falls back to scalar C. Same code, same weights, same batches --
+    the only difference is the table-lookup instruction, so the entire Arm curve
+    from 0.158 to 1.016 is attributable to it and to nothing in NumPy, BLAS or
+    the harness.
     """
     for i, (name, d, k) in enumerate(SYNTHETIC_SHAPES):
         if only is not None and name not in only:

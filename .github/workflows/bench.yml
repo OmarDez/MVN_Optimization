@@ -98,6 +98,21 @@ jobs:
             --bits 4 --batches 256 --repeat 30 \
             --out results/crossover-tail-${{ matrix.runner }}.json
 
+      # One real shape, to put the crossover on a scale a reader already has:
+      # 4096x11008 is a Llama-7B FFN layer, 45.1M MACs per sample, 2.7x past the
+      # measured crossover. Batch 64 because W alone is a 721 MiB complex128
+      # array and the x86 leg runs this scalar -- the ratio does not depend on
+      # batch, so there is nothing to gain by paying for a larger one.
+      - name: Transformer-scale FFN shape
+        env:
+          PYMVN_THREADS: '1'
+        run: |
+          python bench/run_bench.py --synthetic \
+            --cases ffn_4096x11008 \
+            --backends onnx neon \
+            --bits 4 --batches 64 --repeat 30 \
+            --out results/ffn-${{ matrix.runner }}.json
+
       # E3, on the architecture the claim is about. PLAN.md 5 asks for this to
       # run on Arm rather than x86, and it now can: the activations are a
       # committed slice, so no dataset and no torchvision are needed. Run with

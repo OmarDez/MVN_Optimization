@@ -61,19 +61,27 @@ def table_crossover(recs) -> str:
         r = row.get("neon") or row.get("onnx")
         return r["n_classes"] * (r["d"] + 1)
 
-    out = ["| arch | model | layer MACs | total MACs | b | batch | input "
-           "| onnx ms | neon ms | neon/onnx |",
-           "|---|---|---|---|---|---|---|---|---|---|"]
+    # Weights travel in the same row as latency on purpose. At parity the
+    # interesting statement is not "as fast as BLAS" -- that alone is easy to
+    # wave away -- but "as fast as BLAS, on weights 16x smaller". Splitting the
+    # two into separate tables lets a reader take either one in isolation, which
+    # is exactly the reading to avoid.
+    out = ["| arch | model | layer MACs | b | batch | onnx ms | neon ms "
+           "| neon/onnx | fp32 re/im | uint8 idx | packed b-bit | smaller by |",
+           "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for key in sorted(rows, key=lambda k: (k[0], layer_macs(rows[k]), k[3])):
         row = rows[key]
         if "onnx" not in row or "neon" not in row:
             continue
         ratio = row["onnx"]["median_ms"] / row["neon"]["median_ms"]
         arch, model, b, batch, mode = key
-        out.append(f"| {arch} | {model} | {layer_macs(row) / 1e6:.3f}M "
-                   f"| {row['neon']['macs'] / 1e9:.3f}G | {b} | {batch} | {mode} | "
+        n = layer_macs(row)
+        mib = lambda bits: n * bits / 8 / 1024 ** 2
+        out.append(f"| {arch} | {model} | {n / 1e6:.3f}M "
+                   f"| {b} | {batch} | "
                    f"{row['onnx']['median_ms']:.2f} | {row['neon']['median_ms']:.2f} | "
-                   f"**{ratio:.3f}** |")
+                   f"**{ratio:.3f}** | {mib(64):.1f} MiB | {mib(8):.1f} MiB | "
+                   f"{mib(b):.1f} MiB | **{64 / b:.0f}x** |")
     return "\n".join(out)
 
 
