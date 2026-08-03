@@ -32,6 +32,27 @@ structure. This project makes that claim executable, measurable and falsifiable.
 C5 is stated as a non-claim on purpose. Section 7 explains why, and what
 replaces it.
 
+### 1.2 Ablations: everything tried, including what failed
+
+Four of these are negative. They are listed at the same level as the positive
+results on purpose — each is a hypothesis a reviewer will independently have,
+and "measured and refuted, with the mechanism" is a stronger answer than
+silence. Detail in §5.
+
+| # | Idea | Outcome | Where |
+|---|---|---|---|
+| E3 | Quantize phase to b bits | **Works.** b = 4 within 0.0004 of b = 8; nothing above b = 4 buys anything | §5 E3 |
+| E3b | Prune weights `phase_only` amplifies | **Works.** τ = 0.06 removes 45 % of weights and *raises* accuracy, recovering 60 % of the modulus gap | §5 E3b |
+| — | Determine the sector without `atan2` | **Works in C.** 2.2× on conversion, 1.38× on the head. The same tree in NumPy is 2.25× *slower* | `to_indices(c_kernel=True)` |
+| E3c | Train on the torus (Riemannian) | **Refuted.** 0.8224 vs 0.8204 for extrinsic projection — the distinction is worth ten test samples. \|w\| is capacity, not overhead | §5 E3c |
+| E3d | Per-group modulus scales (GPTQ/AWQ style) | **Refuted.** G = 32 is *worse* than discarding the modulus (−79.5 %); only helps at G ≈ d₁, which is full-polar. No block structure exists to exploit: shuffling the input axis changes nothing | §5 E3d |
+| — | Hard-project weights onto S¹ each step | **Refuted.** Closes the modulus gap to exactly 0.0000 and produces a worse model (0.8135 vs 0.8571) | §5 E3c |
+| — | Group scales as powers of two | **Refuted.** Strictly worse than fp32 scales at every G | §5 E3d |
+
+The best genuinely multiplier-free configuration is **train unconstrained,
+discard the modulus at inference, prune what that amplifies**: 0.9089, against
+0.8939 unpruned and 0.8224 for the principled-looking alternative.
+
 ---
 
 ## 2. Mathematics

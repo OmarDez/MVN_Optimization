@@ -149,12 +149,17 @@ class AngularHead:
         self.sparsity = float(1.0 - self.keep.mean())
 
         # Quantized weights, in both representations.
-        self.W_q = alg.quantize_unit(self.W_fp, self.b, self.phase_only)
-        if self.prune_tau > 0:
-            self.W_q = np.where(self.keep, self.W_q, 0)
-        self.kW = np.ascontiguousarray(
-            alg.phase_to_index(np.angle(self.W_fp), self.b), dtype=np.uint8
-        )
+        self._W_q = None            # built on demand: see the property below
+        # Built in row blocks. `phase_to_index(np.angle(W))` allocates two
+        # full-size temporaries (float64 angles, then int64 indices) before
+        # narrowing to uint8, which for a transformer-width layer is several
+        # gigabytes to produce a few hundred megabytes. Chunking caps the
+        # temporary at one block and costs nothing measurable.
+        self.kW = np.empty(self.W_fp.shape, dtype=np.uint8)
+        step = max(1, (1 << 22) // max(self.d1, 1))
+        for r0 in range(0, self.n_classes, step):
+            r1 = min(r0 + step, self.n_classes)
+            self.kW[r0:r1] = alg.phase_to_index(np.angle(self.W_fp[r0:r1]), self.b)
 
         if packed:
             if backend != "neon":
@@ -219,6 +224,24 @@ class AngularHead:
         self._ort_sess = None  # built lazily
 
     # -- helpers ------------------------------------------------------------
+
+    @property
+    def W_q(self) -> np.ndarray:
+        """
+        Quantized complex weights, materialized on first use.
+
+        Only the complex and onnx backends need this; the angular ones read
+        `kW`, which is 16x smaller. Building it eagerly doubled the resident set
+        for every head, and at transformer FFN width that is the difference
+        between running and being killed: for 8192x28672 the complex128 form is
+        3.6 GiB, so an angular head used to need 7.2 GiB to touch none of it.
+        """
+        if self._W_q is None:
+            W = alg.quantize_unit(self.W_fp, self.b, self.phase_only)
+            if self.prune_tau > 0:
+                W = np.where(self.keep, W, 0)
+            self._W_q = W
+        return self._W_q
 
     def _with_bias(self, X: np.ndarray) -> np.ndarray:
         """Prepend the constant-1 input that the bias weight multiplies."""
@@ -307,6 +330,10 @@ class AngularHead:
 
         if self._ort_sess is None:
             self._ort_sess = self._build_ort_session()
+            # The session owns its own copy of the weights, so the complex form
+            # is dead here. At transformer width it is 3.6 GiB of dead weight
+            # held for the rest of the run.
+            self._W_q = None
 
         out = self._ort_sess.run(None, {"Xr": Xr, "Xi": Xi})
         return out[0].astype(np.float64) + 1j * out[1].astype(np.float64)

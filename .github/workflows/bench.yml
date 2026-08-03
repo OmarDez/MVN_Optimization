@@ -56,6 +56,34 @@ jobs:
           SR=$(find /tmp/sysreport -name 'sysreport*.py' | head -1)
           [ -n "$SR" ] && python "$SR" >> results/hostinfo-${{ matrix.runner }}.txt 2>&1 || true
 
+      # Ten seconds, before anything that takes forty-five minutes. `if: always()`
+      # on the upload fixes the symptom -- a late failure discarding finished
+      # measurements -- but the cause was that a missing fixture is only noticed
+      # at the end. Everything the long steps depend on is checked here instead,
+      # so the job dies immediately or not at all.
+      - name: Preflight
+        run: |
+          python - <<'PY'
+          import pathlib, sys
+          need_files = [
+              "tests/data/mlmvn_mnist_activations.npz",   # E3 ablation input
+              "models/mlmvn_fft_mnist.npz",               # its checkpoint
+          ]
+          need_cases = ["head_512x10", "layer_2048x64", "layer_4096x256",
+                        "layer_6144x384", "layer_8192x512", "layer_12288x768",
+                        "layer_16384x1024", "ffn_4096x11008"]
+          bad = [f for f in need_files if not pathlib.Path(f).is_file()]
+          sys.path.insert(0, "bench")
+          from run_bench import SYNTHETIC_SHAPES
+          known = {n for n, _, _ in SYNTHETIC_SHAPES}
+          bad += [f"unknown case {c}" for c in need_cases if c not in known]
+          import pymvn, bench.plot_ablation  # noqa: F401  -- import-time errors
+          if bad:
+              print("preflight FAILED:", *bad, sep="\n  ")
+              raise SystemExit(1)
+          print(f"preflight ok: {len(need_files)} files, {len(need_cases)} cases")
+          PY
+
       - name: Benchmark
         env:
           PYMVN_THREADS: '1'
@@ -130,6 +158,75 @@ jobs:
             --backends onnx neon \
             --bits 4 --batches 64 --repeat 30 \
             --out results/ffn-${{ matrix.runner }}.json
+
+      # Where does the margin stop growing? 45.1M MACs/sample gives 1.198 and
+      # 16.8M gives 1.016, so the trend is up -- but nothing above 45.1M has been
+      # measured, and the two hypotheses differ: it keeps climbing, or it flattens
+      # because the kernel went memory-bound, which would locate the ceiling.
+      # Llama-70B width (8192x28672) is NOT here: it needs ~21.7 GiB, and the
+      # cost is the ONNX baseline rather than the angular head -- serializing
+      # initializers into a protobuf copies the weights twice more. The angular
+      # side of that shape is 235 MiB of uint8.
+      - name: FFN scaling sweep
+        env:
+          PYMVN_THREADS: '1'
+        run: |
+          python bench/run_bench.py --synthetic \
+            --cases ffn_5120x13824 \
+            --backends onnx neon \
+            --bits 4 --batches 64 --repeat 30 --reference onnx \
+            --out results/ffn-scaling-${{ matrix.runner }}.json
+
+      # Llama-33B width measured 11.0 GiB locally, which fits a 16 GiB runner
+      # with no margin worth trusting. Its own step, allowed to fail: losing the
+      # largest point must not cost the rest of the sweep.
+      - name: FFN scaling sweep (33B width, may not fit)
+        continue-on-error: true
+        env:
+          PYMVN_THREADS: '1'
+        run: |
+          python bench/run_bench.py --synthetic \
+            --cases ffn_6656x17920 \
+            --backends onnx neon \
+            --bits 4 --batches 64 --repeat 30 --reference onnx \
+            --out results/ffn-scaling33-${{ matrix.runner }}.json
+
+      # Memory-bound or compute-bound? The ratio was measured batch-independent,
+      # but only on shapes whose weights fit in cache for BOTH backends. At FFN
+      # width they do not: 360 MiB of fp32 real/imag against 45 MiB of uint8
+      # indices. If the margin is weight streaming, raising the batch amortizes
+      # ONNX's traffic over more samples and the ratio must FALL. If it stays
+      # flat, the margin is arithmetic. That discriminates without needing perf,
+      # which hosted runners usually refuse to arm.
+      - name: Memory-vs-compute discriminator
+        env:
+          PYMVN_THREADS: '1'
+        run: |
+          python bench/run_bench.py --synthetic \
+            --cases ffn_4096x11008 \
+            --backends onnx neon \
+            --bits 4 --batches 16 64 256 --repeat 20 --reference onnx \
+            --out results/ffn-batch-${{ matrix.runner }}.json
+
+      # And the counters themselves, when the runner allows it. perf_event_paranoid
+      # is usually 2 or higher on hosted machines, so this is best-effort and must
+      # never fail the job -- the discriminator above is the load-bearing evidence.
+      - name: Hardware counters (best effort)
+        continue-on-error: true
+        run: |
+          sudo sysctl -w kernel.perf_event_paranoid=1 || true
+          which perf || sudo apt-get install -y linux-tools-common linux-tools-generic || true
+          EV=cycles,instructions,cache-references,cache-misses
+          [ "$(uname -m)" = "aarch64" ] && \
+            EV=cycles,instructions,L1D_CACHE_REFILL,L2D_CACHE_REFILL,MEM_ACCESS,INST_RETIRED
+          for BK in onnx neon; do
+            echo "=== $BK ===" >> results/perf-${{ matrix.runner }}.txt
+            perf stat -e "$EV" -- python bench/run_bench.py --synthetic \
+              --cases ffn_4096x11008 --backends "$BK" --bits 4 --batches 64 \
+              --repeat 3 --warmup 1 --reference onnx --out /dev/null \
+              >> results/perf-${{ matrix.runner }}.txt 2>&1 || true
+          done
+          cat results/perf-${{ matrix.runner }}.txt || true
 
       # E3, on the architecture the claim is about. PLAN.md 5 asks for this to
       # run on Arm rather than x86, and it now can: the activations are a

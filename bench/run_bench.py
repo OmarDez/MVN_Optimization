@@ -157,7 +157,11 @@ SYNTHETIC_SHAPES = [
     ("layer_8192x512", 8192, 512),     # 0.891: close, but did not cross
     ("layer_12288x768", 12288, 768),   # straddles the revised estimate
     ("layer_16384x1024", 16384, 1024), # 1.016: the crossover
-    ("ffn_4096x11008", 4096, 11008),   # a Llama-7B FFN layer, to scale
+    # Transformer FFN widths, to answer where the margin stops growing.
+    ("ffn_4096x11008", 4096, 11008),   # Llama-7B      45.1M MACs/sample
+    ("ffn_5120x13824", 5120, 13824),   # Llama-13B     70.8M
+    ("ffn_6656x17920", 6656, 17920),   # Llama-33B    119.3M
+    ("ffn_8192x28672", 8192, 28672),   # Llama-70B    234.9M
 ]
 
 
@@ -261,6 +265,15 @@ def main() -> int:
                     help="feed the angular backends uint8 phase indices instead "
                          "of complex activations, and time the conversion "
                          "separately. This is the phase-native regime.")
+    ap.add_argument("--reference", choices=["complex128", "onnx"],
+                    default="complex128",
+                    help="what agreement_vs_fp is measured against. complex128 "
+                         "is the ground truth and the default. At transformer "
+                         "FFN width its weights are 3.6 GiB on top of everything "
+                         "else, so `onnx` is offered as a substitute: it is the "
+                         "same complex arithmetic in fp32 (test_parity checks "
+                         "that), it is the deployment baseline anyway, and its "
+                         "session already exists.")
     ap.add_argument("--out", default="results/bench.json")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -292,7 +305,9 @@ def main() -> int:
     for model_name, W, d in cases:
         for batch in args.batches:
             X = np.exp(1j * rng.uniform(0, 2 * np.pi, (batch, d)))
-            ref_pred = AngularHead(W, b=8, backend="complex128").predict(X)
+            ref_head = AngularHead(W, b=8, backend=args.reference)
+            ref_pred = ref_head.predict(X)
+            del ref_head
 
             for b in args.bits:
                 row = {}
@@ -331,6 +346,7 @@ def main() -> int:
                         "n_classes": int(W.shape[0]),
                         "macs": int(W.shape[0] * (d + 1) * batch),
                         "agreement_vs_fp": float((pred == ref_pred).mean()),
+                        "reference": args.reference,
                         "input_mode": "indices" if use_idx else "complex",
                         "convert_ms": convert_ms if use_idx else None,
                         "convert_c_ms": convert_c_ms if use_idx else None,
